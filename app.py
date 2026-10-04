@@ -11,9 +11,9 @@ from google.transit import gtfs_realtime_pb2
 
 # --- 1. PAGE SETUP ---
 st.set_page_config(layout="wide", page_title="Delhi Transit Nav", page_icon="🚍")
-st.title("🚍 Advanced Transit Navigation & Radar")
+st.title("🚍 Advanced Transit Navigation")
 
-# --- 2. GOD-TIER PHYSICS & DISTANCE ENGINE ---
+# --- 2. GOD-TIER PHYSICS ENGINE ---
 def get_distance_meters(lat1, lon1, lat2, lon2):
     R = 6371000 
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -31,7 +31,7 @@ def format_duration(seconds):
     if mins > 0: return f"{mins}m {secs}s"
     return f"{secs}s"
 
-# --- 3. EXACT TERMINAL COORDINATES ---
+# --- 3. TERMINAL COORDINATES ---
 ROUTE_TERMINALS = {
     "D-9919": {"T1": (28.6190, 77.0321, "Towards Dwarka Mor"), "T2": (28.5135, 77.0853, "Towards Kapashera Border")},
     "D-068": {"T1": (28.6190, 77.0321, "Towards Dwarka Mor"), "T2": (28.5520, 77.0580, "Towards Sector 21")},
@@ -39,21 +39,19 @@ ROUTE_TERMINALS = {
 }
 
 # --- 4. SMART MEMORY SYSTEM ---
-if 'view_state' not in st.session_state:
-    st.session_state.view_state = pdk.ViewState(latitude=28.5800, longitude=77.0500, zoom=12.5, pitch=0)
+if 'view_state' not in st.session_state: st.session_state.view_state = pdk.ViewState(latitude=28.5800, longitude=77.0500, zoom=12.5, pitch=0)
 if 'bus_memory' not in st.session_state: st.session_state.bus_memory = {}
 if 'offline_buses' not in st.session_state: st.session_state.offline_buses = {}
 if 'target_bus' not in st.session_state: st.session_state.target_bus = "None"
-if 'prev_target' not in st.session_state: st.session_state.prev_target = "None"
 if 'cached_buses' not in st.session_state: st.session_state.cached_buses = []
 
 MY_ROUTES = {
-    "3753": {"route": "D-9919", "dir": "Towards Kapashera Border", "color": [220, 20, 20]},
-    "3752": {"route": "D-9919", "dir": "Towards Dwarka Mor", "color": [220, 20, 20]},
-    "2804": {"route": "D-068",  "dir": "Towards Sector 21", "color": [20, 100, 220]},
-    "2801": {"route": "D-068",  "dir": "Towards Dwarka Mor", "color": [20, 100, 220]},
-    "2179": {"route": "718",    "dir": "Towards Kapashera Border", "color": [20, 180, 20]},
-    "2176": {"route": "718",    "dir": "Towards Uttam Nagar", "color": [20, 180, 20]}
+    "3753": {"route": "D-9919", "dir": "Towards Kapashera Border", "color": [220, 20, 20], "badge": "🔴"},
+    "3752": {"route": "D-9919", "dir": "Towards Dwarka Mor", "color": [220, 20, 20], "badge": "🔴"},
+    "2804": {"route": "D-068",  "dir": "Towards Sector 21", "color": [20, 100, 220], "badge": "🔵"},
+    "2801": {"route": "D-068",  "dir": "Towards Dwarka Mor", "color": [20, 100, 220], "badge": "🔵"},
+    "2179": {"route": "718",    "dir": "Towards Kapashera Border", "color": [20, 180, 20], "badge": "🟢"},
+    "2176": {"route": "718",    "dir": "Towards Uttam Nagar", "color": [20, 180, 20], "badge": "🟢"}
 }
 
 # --- 5. SIDEBAR CONTROLS ---
@@ -73,7 +71,6 @@ URL = f"https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb?key={API_KEY}"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 current_time = time.time()
 
-# Configure requests with built-in retries to prevent connection crashes
 session = requests.Session()
 retries = Retry(total=2, backoff_factor=0.2)
 session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -107,7 +104,8 @@ try:
                         st.session_state.bus_memory[v_id] = {
                             "lat": lat, "lon": lon, "anchor_lat": lat, "anchor_lon": lon, 
                             "last_api_update": current_time, "speed": 0.0, "stop_time": current_time, 
-                            "route": public_route, "internal": raw_route_id, "direction": info["dir"] 
+                            "route": public_route, "internal": raw_route_id, "direction": info["dir"],
+                            "badge": info["badge"], "color": info["color"]
                         }
                     else:
                         mem = st.session_state.bus_memory[v_id]
@@ -139,28 +137,22 @@ try:
 
                     mem = st.session_state.bus_memory[v_id]
                     status_str = f"🛑 Stopped ({format_duration(current_time - mem['stop_time'])})" if mem["stop_time"] else "🟢 Moving"
-
                     if v_id in st.session_state.offline_buses: del st.session_state.offline_buses[v_id]
-
                     icon_data = {"url": "https://img.icons8.com/color/48/bus.png", "width": 48, "height": 48, "anchorY": 48}
 
                     active_buses_data.append({
                         "Route": public_route, "Vehicle ID": v_id, "Internal ID": raw_route_id,
                         "Direction": mem["direction"], "Speed (km/h)": mem["speed"], "Status": status_str,
-                        "lat": lat, "lon": lon, "color": info["color"], "icon_data": icon_data
+                        "lat": lat, "lon": lon, "color": mem["color"], "badge": mem["badge"], "icon_data": icon_data
                     })
-        st.session_state.cached_buses = active_buses_data # Cache successful data
+        st.session_state.cached_buses = active_buses_data 
 except Exception as e:
-    # SILENT FALLBACK: If network drops, use the cached data. Don't crash the app!
     active_buses_data = st.session_state.cached_buses
     st.toast("⚠️ Weak Signal: Retrying connection...", icon="📡")
 
-# --- SMART SORTING (Up Directions first, Down Directions second) ---
+# --- 7. SMART TABULAR SORTING ---
 def sort_buses(bus):
-    top_directions = ["Towards Dwarka Mor", "Towards Uttam Nagar"]
-    group = 0 if bus["Direction"] in top_directions else 1
-    return (group, bus["Route"], bus["Vehicle ID"])
-
+    return (bus["Route"], bus["Direction"], bus["Vehicle ID"])
 active_buses_data.sort(key=sort_buses)
 
 # --- OFFLINE BUS TRACKER ---
@@ -177,32 +169,54 @@ if connection_success:
 
 df_active = pd.DataFrame(active_buses_data)
 
-# --- 7. NEW MOBILE-FRIENDLY CAMERA TARGETING ---
-col_target, _ = st.columns([2, 2])
+# --- 8. MOBILE UI: TABULAR TARGETING MENU & STRICT LOCK ---
+col_target, _ = st.columns([3, 1])
+
 with col_target:
-    with st.expander("🎯 Target & Center Camera on Specific Bus", expanded=False):
-        lock_camera = st.toggle("🔒 Lock Camera (Follow Bus)", value=True, help="Turn OFF to scroll map freely")
+    # Build Dynamic Menu Title
+    target_info = None
+    if st.session_state.target_bus != "None":
+        for b in active_buses_data:
+            if b["Vehicle ID"] == st.session_state.target_bus:
+                target_info = b
+                break
+
+    if target_info:
+        expander_title = f"🎯 Tracking: {target_info['Route']} ➔ {target_info['Direction']} ({target_info['Vehicle ID']})"
+        is_expanded = False # Auto-close menu to save screen space once selected
+    else:
+        expander_title = "🎯 Target & Center Camera on Specific Bus"
+        is_expanded = True
+
+    # The Selection Menu
+    with st.expander(expander_title, expanded=is_expanded):
+        options = ["None"]
+        format_dict = {"None": "🚫 Free Roam (Do not track any bus)"}
         
-        bus_options = ["None"] + [f"{b['Route']} ({b['Direction']}) | ID: {b['Vehicle ID']}" for b in active_buses_data]
-        # Using radio completely disables the mobile keyboard popup!
-        st.session_state.target_bus = st.radio("Select Bus:", bus_options, label_visibility="collapsed")
+        # Build the Visual Tabular Badges & Monospace formatting for Radio
+        for b in active_buses_data:
+            vid = b['Vehicle ID']
+            options.append(vid)
+            # Formatting visually mimics a table using Markdown
+            format_dict[vid] = f"{b['badge']} **{b['Route']}** &nbsp; | &nbsp; 🏁 {b['Direction']} &nbsp; | &nbsp; `{vid}`"
 
-# Camera Jump Logic
+        # The actual selection component (No keyboard popup!)
+        st.session_state.target_bus = st.radio("Select Bus to Track:", options, format_func=lambda x: format_dict[x], label_visibility="collapsed")
+
+    # STRICT CAMERA LOCK TOGGLE (Right above the map)
+    lock_camera = st.toggle("🔒 Strict Tracking Lock", value=True, help="When ON, prevents scrolling and forces camera to stay on the bus.")
+
+# --- 9. CAMERA LOCK LOGIC ---
 target_lat, target_lon = None, None
-if st.session_state.target_bus != "None":
-    target_id = st.session_state.target_bus.split("ID: ")[1]
-    for b in active_buses_data:
-        if b["Vehicle ID"] == target_id:
-            target_lat, target_lon = b["lat"], b["lon"]
-            
-            # Jump if new bus selected OR if Lock is ON
-            if st.session_state.target_bus != st.session_state.prev_target or lock_camera:
-                st.session_state.view_state = pdk.ViewState(latitude=target_lat, longitude=target_lon, zoom=16, pitch=0)
-            break
+if st.session_state.target_bus != "None" and target_info:
+    target_lat, target_lon = target_info["lat"], target_info["lon"]
+    
+    # If Locked, update the view state EVERY loop to force tracking
+    if lock_camera:
+        current_zoom = st.session_state.view_state.zoom # Preserves your zoom level!
+        st.session_state.view_state = pdk.ViewState(latitude=target_lat, longitude=target_lon, zoom=current_zoom, pitch=0)
 
-st.session_state.prev_target = st.session_state.target_bus
-
-# --- 8. UI MAP RENDERING ---
+# --- 10. UI MAP RENDERING ---
 col1, col2 = st.columns([2.5, 1.5])
 
 with col1:
@@ -226,12 +240,16 @@ with col1:
             get_radius=80, stroked=True, line_width_min_pixels=3
         ))
 
+    # The Strict Hardware Map Controller
+    deck_controller = {"dragPan": False, "scrollZoom": True, "touchZoom": True, "doubleClickZoom": True, "keyboard": False} if (lock_camera and target_lat is not None) else True
+
     st.pydeck_chart(pdk.Deck(
         layers=layers, initial_view_state=st.session_state.view_state, map_style=theme_code,
+        controller=deck_controller, # Injects the lock directly into the PyDeck map!
         tooltip={"text": "Route: {Route}\nID: {Vehicle ID}\nSpeed: {Speed (km/h)} km/h\nStatus: {Status}"}
     ))
 
-# --- 9. TABLES ---
+# --- 11. TABLES ---
 with col2:
     st.subheader("🟢 Live Active Buses")
     if not df_active.empty:

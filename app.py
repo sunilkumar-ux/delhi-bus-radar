@@ -152,6 +152,7 @@ except Exception as e:
 
 # --- 7. SMART TABULAR SORTING ---
 def sort_buses(bus):
+    # Groups strictly by Route, then Direction, then ID
     return (bus["Route"], bus["Direction"], bus["Vehicle ID"])
 active_buses_data.sort(key=sort_buses)
 
@@ -183,7 +184,7 @@ with col_target:
 
     if target_info:
         expander_title = f"🎯 Tracking: {target_info['Route']} ➔ {target_info['Direction']} ({target_info['Vehicle ID']})"
-        is_expanded = False # Auto-close menu to save screen space once selected
+        is_expanded = False 
     else:
         expander_title = "🎯 Target & Center Camera on Specific Bus"
         is_expanded = True
@@ -197,26 +198,24 @@ with col_target:
         for b in active_buses_data:
             vid = b['Vehicle ID']
             options.append(vid)
-            # Formatting visually mimics a table using Markdown
             format_dict[vid] = f"{b['badge']} **{b['Route']}** &nbsp; | &nbsp; 🏁 {b['Direction']} &nbsp; | &nbsp; `{vid}`"
 
-        # The actual selection component (No keyboard popup!)
         st.session_state.target_bus = st.radio("Select Bus to Track:", options, format_func=lambda x: format_dict[x], label_visibility="collapsed")
 
-    # STRICT CAMERA LOCK TOGGLE (Right above the map)
-    lock_camera = st.toggle("🔒 Strict Tracking Lock", value=True, help="When ON, prevents scrolling and forces camera to stay on the bus.")
+    # STRICT CAMERA LOCK TOGGLE
+    lock_camera = st.toggle("🔒 Strict Tracking Lock", value=True, help="Prevents scrolling and forces camera to stay on the bus.")
 
 # --- 9. CAMERA LOCK LOGIC ---
 target_lat, target_lon = None, None
 if st.session_state.target_bus != "None" and target_info:
     target_lat, target_lon = target_info["lat"], target_info["lon"]
     
-    # If Locked, update the view state EVERY loop to force tracking
+    # If Locked, update the center coordinates every single loop!
     if lock_camera:
-        current_zoom = st.session_state.view_state.zoom # Preserves your zoom level!
+        current_zoom = st.session_state.view_state.zoom 
         st.session_state.view_state = pdk.ViewState(latitude=target_lat, longitude=target_lon, zoom=current_zoom, pitch=0)
 
-# --- 10. UI MAP RENDERING ---
+# --- 10. UI MAP RENDERING (WITH CRASH-PROOF VIEWS) ---
 col1, col2 = st.columns([2.5, 1.5])
 
 with col1:
@@ -240,12 +239,18 @@ with col1:
             get_radius=80, stroked=True, line_width_min_pixels=3
         ))
 
-    # The Strict Hardware Map Controller
-    deck_controller = {"dragPan": False, "scrollZoom": True, "touchZoom": True, "doubleClickZoom": True, "keyboard": False} if (lock_camera and target_lat is not None) else True
+    # CRASH-PROOF LOCK: Instead of forcing a bad controller dictionary into Deck(), 
+    # we use pdk.View() to safely disable panning in the browser while allowing zoom.
+    if lock_camera and target_lat is not None:
+        map_view = pdk.View(type="MapView", controller={"dragPan": False, "scrollZoom": True, "touchZoom": True})
+    else:
+        map_view = pdk.View(type="MapView", controller=True)
 
     st.pydeck_chart(pdk.Deck(
-        layers=layers, initial_view_state=st.session_state.view_state, map_style=theme_code,
-        controller=deck_controller, # Injects the lock directly into the PyDeck map!
+        layers=layers, 
+        initial_view_state=st.session_state.view_state, 
+        views=[map_view], # Safe injection!
+        map_style=theme_code,
         tooltip={"text": "Route: {Route}\nID: {Vehicle ID}\nSpeed: {Speed (km/h)} km/h\nStatus: {Status}"}
     ))
 

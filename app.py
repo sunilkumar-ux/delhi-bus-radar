@@ -38,12 +38,20 @@ ROUTE_TERMINALS = {
     "718": {"T1": (28.6210, 77.0560, "Towards Uttam Nagar"), "T2": (28.5135, 77.0853, "Towards Kapashera Border")}
 }
 
-# --- 4. SMART MEMORY SYSTEM ---
+# --- 4. SMART MEMORY SYSTEM (FIXED MEMORY LEAK) ---
 if 'view_state' not in st.session_state: st.session_state.view_state = pdk.ViewState(latitude=28.5800, longitude=77.0500, zoom=12.5, pitch=0)
 if 'bus_memory' not in st.session_state: st.session_state.bus_memory = {}
 if 'offline_buses' not in st.session_state: st.session_state.offline_buses = {}
 if 'target_bus' not in st.session_state: st.session_state.target_bus = "None"
 if 'cached_buses' not in st.session_state: st.session_state.cached_buses = []
+if 'toast_shown' not in st.session_state: st.session_state.toast_shown = False # Prevents Toast Spam crashes
+
+# CRITICAL FIX: Only open ONE network session and keep it forever.
+if 'http_session' not in st.session_state:
+    session = requests.Session()
+    retries = Retry(total=2, backoff_factor=0.2)
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    st.session_state.http_session = session
 
 MY_ROUTES = {
     "3753": {"route": "D-9919", "dir": "Towards Kapashera Border", "color": [220, 20, 20], "badge": "🔴"},
@@ -63,7 +71,7 @@ selected_route = st.sidebar.radio("Filter Route:", ["All Buses", "D-9919", "D-06
 st.sidebar.divider()
 st.sidebar.header("⏱️ Refresh Controls")
 auto_refresh = st.sidebar.toggle("Enable Auto-Refresh", value=True)
-refresh_rate = st.sidebar.number_input("Refresh Speed (Seconds):", min_value=1, max_value=60, value=3)
+refresh_rate = st.sidebar.number_input("Refresh Speed (Seconds):", min_value=1, max_value=60, value=5)
 
 # --- 6. ROBUST NETWORK ENGINE ---
 API_KEY = "tuM2vKfg6Zdjl53tFJ45WzwdUcBBWPMI"
@@ -71,18 +79,16 @@ URL = f"https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb?key={API_KEY}"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 current_time = time.time()
 
-session = requests.Session()
-retries = Retry(total=2, backoff_factor=0.2)
-session.mount('https://', HTTPAdapter(max_retries=retries))
-
 active_buses_data = []
 active_bus_ids = set()
 connection_success = False
 
 try:
-    response = session.get(URL, headers=HEADERS, timeout=8)
+    # Use the saved, single network session
+    response = st.session_state.http_session.get(URL, headers=HEADERS, timeout=8)
     if response.status_code == 200:
         connection_success = True
+        st.session_state.toast_shown = False # Reset toast flag
         feed = gtfs_realtime_pb2.FeedMessage()
         feed.ParseFromString(response.content)
 
@@ -148,11 +154,13 @@ try:
         st.session_state.cached_buses = active_buses_data 
 except Exception as e:
     active_buses_data = st.session_state.cached_buses
-    st.toast("⚠️ Weak Signal: Retrying connection...", icon="📡")
+    # Prevent toast spam crash by only showing the warning once per disconnection
+    if not st.session_state.toast_shown:
+        st.toast("⚠️ Weak Signal: Retrying connection...", icon="📡")
+        st.session_state.toast_shown = True
 
 # --- 7. SMART TABULAR SORTING ---
 def sort_buses(bus):
-    # Groups strictly by Route, then Direction, then ID
     return (bus["Route"], bus["Direction"], bus["Vehicle ID"])
 active_buses_data.sort(key=sort_buses)
 
@@ -174,7 +182,6 @@ df_active = pd.DataFrame(active_buses_data)
 col_target, _ = st.columns([3, 1])
 
 with col_target:
-    # Build Dynamic Menu Title
     target_info = None
     if st.session_state.target_bus != "None":
         for b in active_buses_data:
@@ -189,12 +196,10 @@ with col_target:
         expander_title = "🎯 Target & Center Camera on Specific Bus"
         is_expanded = True
 
-    # The Selection Menu
     with st.expander(expander_title, expanded=is_expanded):
         options = ["None"]
         format_dict = {"None": "🚫 Free Roam (Do not track any bus)"}
         
-        # Build the Visual Tabular Badges & Monospace formatting for Radio
         for b in active_buses_data:
             vid = b['Vehicle ID']
             options.append(vid)
@@ -202,7 +207,6 @@ with col_target:
 
         st.session_state.target_bus = st.radio("Select Bus to Track:", options, format_func=lambda x: format_dict[x], label_visibility="collapsed")
 
-    # STRICT CAMERA LOCK TOGGLE
     lock_camera = st.toggle("🔒 Strict Tracking Lock", value=True, help="Prevents scrolling and forces camera to stay on the bus.")
 
 # --- 9. CAMERA LOCK LOGIC ---
@@ -210,7 +214,6 @@ target_lat, target_lon = None, None
 if st.session_state.target_bus != "None" and target_info:
     target_lat, target_lon = target_info["lat"], target_info["lon"]
     
-    # If Locked, update the center coordinates every single loop!
     if lock_camera:
         current_zoom = st.session_state.view_state.zoom 
         st.session_state.view_state = pdk.ViewState(latitude=target_lat, longitude=target_lon, zoom=current_zoom, pitch=0)
@@ -239,8 +242,6 @@ with col1:
             get_radius=80, stroked=True, line_width_min_pixels=3
         ))
 
-    # CRASH-PROOF LOCK: Instead of forcing a bad controller dictionary into Deck(), 
-    # we use pdk.View() to safely disable panning in the browser while allowing zoom.
     if lock_camera and target_lat is not None:
         map_view = pdk.View(type="MapView", controller={"dragPan": False, "scrollZoom": True, "touchZoom": True})
     else:
@@ -249,7 +250,7 @@ with col1:
     st.pydeck_chart(pdk.Deck(
         layers=layers, 
         initial_view_state=st.session_state.view_state, 
-        views=[map_view], # Safe injection!
+        views=[map_view],
         map_style=theme_code,
         tooltip={"text": "Route: {Route}\nID: {Vehicle ID}\nSpeed: {Speed (km/h)} km/h\nStatus: {Status}"}
     ))

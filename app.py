@@ -1,7 +1,12 @@
 """
 Delhi Transit Radar - Live Bus Fleet Tracking
 Real-time tracking of Delhi public transit buses (Delhi OTD GTFS-realtime).
-Optimized for mobile & desktop with rotatable directional bus icons and high-contrast neon radar styling.
+Features:
+- Continuous 0-360 degree smooth directional bus rotation
+- Strict camera tracking lock (pan disabled, pinch/scroll zoom enabled)
+- Preserved map scroll/pan position on feed updates
+- Mobile-optimized tap & touch targets with instant tooltips
+- High-contrast neon radar styling & zero keyboard intrusion
 """
 
 from __future__ import annotations
@@ -100,8 +105,8 @@ CARTO_LIGHT = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 
 # Physics / telemetry thresholds
 MOVING_KMH = 3.0
-JITTER_M = 5.0
-TRAIL_MIN_M = 15.0
+JITTER_M = 3.5           # Distance threshold to update continuous trajectory bearing
+TRAIL_MIN_M = 15.0       # Minimum distance to append point to trail
 TRAIL_MAX_GAP_M = 350.0  # Reset trail if jump exceeds 350m to avoid chords cutting across city
 MAX_SANE_KMH = 105.0
 MAX_DT_FOR_SPEED_S = 180
@@ -110,8 +115,8 @@ STALE_S = 180
 STALE_NO_TS_S = 900
 TRAIL_POINTS = 35
 
-# Network caching & timing
-FETCH_TTL_S = 3  # Fast 3s cache for immediate location synchronization
+# Fast 3s cache for immediate synchronization
+FETCH_TTL_S = 3
 OFFLINE_MISSING_SNAPSHOTS = 3
 OFFLINE_GRACE_S = 45
 OFFLINE_KEEP_S = 4 * 3600
@@ -126,11 +131,11 @@ IST = dt.timezone(dt.timedelta(hours=5, minutes=30), "IST")
 def generate_bus_svg_icon(color_hex: str) -> dict:
     """
     Generates a top-down transit bus SVG icon pointing North (0 degrees).
-    When Deck.gl applies get_angle="bearing", the bus icon rotates smoothly
-    to face the exact direction of travel (North, South, East, West, etc.).
+    Deck.gl applies get_angle="bearing_angle" to continuously rotate
+    the bus to every single degree (0.0 to 360.0).
     """
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
-  <rect x="14" y="6" width="32" height="48" rx="8" fill="{color_hex}" fill-opacity="0.25"/>
+  <rect x="14" y="6" width="32" height="48" rx="8" fill="{color_hex}" fill-opacity="0.28"/>
   <rect x="16" y="8" width="28" height="44" rx="7" fill="#0b1120" stroke="{color_hex}" stroke-width="2.5"/>
   <circle cx="19.5" cy="10" r="2.2" fill="#ffffff"/>
   <circle cx="40.5" cy="10" r="2.2" fill="#ffffff"/>
@@ -152,7 +157,7 @@ def generate_bus_svg_icon(color_hex: str) -> dict:
         "anchorY": 30,
     }
 
-# Pre-generate self-contained vector icons for zero network latency & no CORS
+# Pre-generate vector icons for each route's neon color
 BUS_ICONS = {
     "#00FF66": generate_bus_svg_icon("#00FF66"),  # Route 718 (Neon Green)
     "#00E5FF": generate_bus_svg_icon("#00E5FF"),  # Route D-068 (Neon Blue)
@@ -161,7 +166,7 @@ BUS_ICONS = {
 
 
 # =============================================================================
-# 3. HELPER FUNCTIONS & GEOMETRY
+# 3. HELPER FUNCTIONS & CONTINUOUS BEARING CALCULATIONS
 # =============================================================================
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -174,7 +179,10 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def calc_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Computes the forward azimuth compass heading in degrees from point 1 to point 2."""
+    """
+    Computes true continuous 0.0 - 360.0 degree forward azimuth heading from point 1 to point 2.
+    Ensures every degree of road curvature is accurately tracked.
+    """
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dlon = math.radians(lon2 - lon1)
     y = math.sin(dlon) * math.cos(p2)
@@ -348,7 +356,7 @@ def fetch_feed(api_key: str) -> dict:
 
 
 # =============================================================================
-# 5. FLEET TRACKER & TELEMETRY ENGINE
+# 5. FLEET TRACKER & CONTINUOUS HEADING ENGINE
 # =============================================================================
 
 class FleetTracker:
@@ -391,7 +399,10 @@ class FleetTracker:
         self.offline.pop(vid, None)
         st_ = self.buses.get(vid)
 
-        bearing = rec["bearing"] if rec["bearing"] is not None and rec["bearing"] > 0 else 0.0
+        # Initial heading estimate based on route destination
+        initial_bearing = 190.0 if "Kapashera" in info["dir"] else 20.0
+        if rec["bearing"] is not None and rec["bearing"] > 0:
+            initial_bearing = rec["bearing"]
 
         if st_ is None:
             fix_time = rec["ts"] if has_ts else wall
@@ -408,7 +419,7 @@ class FleetTracker:
                 "color": info["color"],
                 "lat": rec["lat"],
                 "lon": rec["lon"],
-                "bearing": bearing,
+                "bearing": round(initial_bearing, 1),
                 "fix_time": fix_time,
                 "has_ts": has_ts,
                 "last_seen": wall,
@@ -445,11 +456,12 @@ class FleetTracker:
             is_new = moved_m > 0.5
             fix_time = wall if is_new else st_["fix_time"]
 
-        # Calculate accurate heading if bus moved
-        if rec["bearing"] is not None and rec["bearing"] > 0:
-            st_["bearing"] = rec["bearing"]
-        elif moved_m >= JITTER_M:
-            st_["bearing"] = calc_bearing(st_["lat"], st_["lon"], rec["lat"], rec["lon"])
+        # Calculate exact continuous 0.0-360.0 degree heading along road
+        if moved_m >= JITTER_M:
+            exact_heading = calc_bearing(st_["lat"], st_["lon"], rec["lat"], rec["lon"])
+            st_["bearing"] = round(exact_heading, 1)
+        elif rec["bearing"] is not None and rec["bearing"] > 0 and st_["bearing"] == 0.0:
+            st_["bearing"] = round(rec["bearing"], 1)
 
         if rec["speed_ms"] is not None:
             st_["speed_feed"] = rec["speed_ms"] * 3.6
@@ -471,7 +483,7 @@ class FleetTracker:
             prev = st_["speed_calc"]
             st_["speed_calc"] = derived if (derived == 0.0 or prev <= 0.0) else 0.6 * derived + 0.4 * prev
 
-        # Trail filtering: only append real travel, reset if teleport / jump > 350m
+        # Trail filtering: only append actual street travel, reset if jump > 350m
         if moved_m >= TRAIL_MIN_M:
             if moved_m > TRAIL_MAX_GAP_M:
                 st_["trail"].clear()
@@ -586,7 +598,7 @@ def get_tracker() -> FleetTracker:
 
 
 # =============================================================================
-# 6. UI & MOBILE STYLING
+# 6. UI & MOBILE STYLING (NO VIRTUAL KEYBOARD POPUP)
 # =============================================================================
 
 CUSTOM_CSS = """
@@ -598,6 +610,14 @@ CUSTOM_CSS = """
 }
 header[data-testid="stHeader"] {
     background-color: transparent !important;
+}
+
+/* Prevent Android keyboard from opening on selectbox click */
+div[data-testid="stSelectbox"] input {
+    pointer-events: none !important;
+    caret-color: transparent !important;
+    user-select: none !important;
+    -webkit-user-select: none !important;
 }
 
 /* App Header */
@@ -625,7 +645,7 @@ header[data-testid="stHeader"] {
     border-radius: 12px;
 }
 
-/* Compact 3-Pill Stats Bar (Active, Moving, Stopped) */
+/* Compact 3-Pill Stats Bar */
 .stats-strip {
     display: flex;
     align-items: center;
@@ -667,13 +687,13 @@ header[data-testid="stHeader"] {
 .stat-moving .stat-val { color: #00FF66; }
 .stat-stopped .stat-val { color: #FFAB00; }
 
-/* Compact Tracking HUD Card */
+/* Tracking HUD Card */
 .hud-strip {
     background: linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(24, 33, 53, 0.9));
     border: 1px solid rgba(0, 229, 255, 0.35);
     border-radius: 10px;
     padding: 8px 12px;
-    margin: 6px 0 10px 0;
+    margin: 4px 0 8px 0;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
 }
 .hud-top-line {
@@ -751,6 +771,12 @@ div[data-testid="stButton"] > button {
     font-weight: 600 !important;
     min-height: 32px !important;
 }
+
+/* Deck.gl Tooltip mobile overrides */
+.deck-tooltip {
+    pointer-events: none !important;
+    z-index: 999999 !important;
+}
 </style>
 """
 
@@ -789,6 +815,8 @@ def main() -> None:
         st.session_state.view_state = pdk.ViewState(pitch=0, bearing=0, **DEFAULT_VIEW)
     if "target_bus" not in st.session_state:
         st.session_state.target_bus = "None"
+    if "view_initialized" not in st.session_state:
+        st.session_state.view_initialized = False
 
     # ---------------- Sidebar Controls ----------------
     sb = st.sidebar
@@ -798,9 +826,7 @@ def main() -> None:
 
     selected_route = sb.selectbox("Filter Route:", ["All Routes"] + ROUTE_NAMES)
 
-    lock_camera = sb.toggle("🔒 Camera Lock on Bus", value=True,
-                            help="Automatically keeps the tracked vehicle centered in view.")
-    follow_zoom = sb.slider("Tracking Zoom", 12.0, 17.0, 14.8, 0.2)
+    follow_zoom = sb.slider("Follow Zoom (When Locked):", 12.0, 17.5, 15.0, 0.2)
     show_trail = sb.toggle("🧵 Show Movement Trail", value=True)
 
     sb.divider()
@@ -868,7 +894,7 @@ def main() -> None:
         if health["last_error"]:
             st.warning(f"⚠️ Feed connection alert: {health['last_error']}. Showing last available data.")
 
-        # 3. Compact 3-Pill Stats Bar (Active, Moving, Stopped - No GPS & Offline removed as requested)
+        # 3. Compact 3-Pill Stats Bar
         n_move = sum(v["state"] == "moving" for v in views)
         n_stop = sum(v["state"] == "stopped" for v in views)
         stats_html = (
@@ -880,10 +906,33 @@ def main() -> None:
         )
         st.markdown(stats_html, unsafe_allow_html=True)
 
+        # 4. Bus Tracking Selection Menu (Re-added, Clean, No Keyboard, Persisted State)
         target_id = st.session_state.target_bus
         target_info = next((v for v in views if v["vehicle_id"] == target_id), None) if target_id != "None" else None
 
-        # 4. Telemetry HUD for Selected Bus (Compact & clean, Compass and Last Fix removed as requested)
+        bus_choices = ["None"] + [v["vehicle_id"] for v in views]
+        def format_choice(vid: str) -> str:
+            if vid == "None":
+                return "🌐 Free Roam (Show All Buses · Camera Unlocked)"
+            v = next((b for b in views if b["vehicle_id"] == vid), None)
+            if not v:
+                return vid
+            return f"{v['badge']} {v['route']} • {v['vehicle_id']} ➔ {v['direction']} ({v['speed_kmh']} km/h)"
+
+        cur_idx = bus_choices.index(target_id) if target_id in bus_choices else 0
+        chosen_bus = st.selectbox(
+            "🎯 Target Bus & Strict Camera Lock:",
+            bus_choices,
+            index=cur_idx,
+            format_func=format_choice,
+            key="bus_track_picker",
+            help="Select any bus to strictly lock the camera. Panning is locked on target, but zoom in/out is enabled.",
+        )
+        if chosen_bus != target_id:
+            st.session_state.target_bus = chosen_bus
+            rerun_fragment()
+
+        # 5. Telemetry HUD for Selected Bus
         if target_info:
             dist_txt = f'<span style="color:#00E5FF;">📍 {target_info["dist_km"]} km to stop</span>' if (use_my_stop and "dist_km" in target_info) else ""
             hud_col_info, hud_col_btn = st.columns([4, 1.2], vertical_alignment="center")
@@ -908,36 +957,55 @@ def main() -> None:
                     st.session_state.target_bus = "None"
                     rerun_fragment()
 
-        # 5. Camera View State Calculation
-        if target_info and lock_camera:
-            st.session_state.view_state = pdk.ViewState(
+        # 6. Map Viewport & Strict Camera Lock Controller
+        # - When tracking: Strict Lock (camera follows bus, dragPan disabled, scroll/touch zoom enabled)
+        # - When in Free Roam: Preserves user's scrolled map position (NEVER resets to default on refresh)
+        if target_info:
+            view_state = pdk.ViewState(
                 latitude=target_info["lat"],
                 longitude=target_info["lon"],
                 zoom=follow_zoom,
                 pitch=0,
                 bearing=0,
             )
-        elif not target_info and views:
-            st.session_state.view_state = fit_view(
-                [(v["lat"], v["lon"]) for v in views],
-                st.session_state.view_state,
+            map_view = pdk.View(
+                type="MapView",
+                controller={
+                    "dragPan": False,
+                    "dragRotate": False,
+                    "scrollZoom": True,
+                    "touchZoom": True,
+                    "doubleClickZoom": True,
+                },
+            )
+        else:
+            # Free Roam: calculate fit_view ONLY ONCE on initial load to preserve user's map scroll
+            if not st.session_state.view_initialized and views:
+                st.session_state.view_state = fit_view([(v["lat"], v["lon"]) for v in views], st.session_state.view_state)
+                st.session_state.view_initialized = True
+
+            view_state = st.session_state.view_state
+            map_view = pdk.View(
+                type="MapView",
+                controller=True,
             )
 
-        # 6. PyDeck Radar Map Layers (Rotatable Bus Icons + Smooth Vertex Transitions)
+        # 7. PyDeck Radar Map Layers (Continuous Rotations, Accurate Trails, Mobile Touch Hit-Targets)
         layers = []
 
-        # Smooth WebGL Transitions (Slides position smoothly across updates without teleporting)
+        # Smooth WebGL Transitions (Slides position & heading smoothly across updates)
         layer_transitions = {
             "getPosition": {"duration": 2200, "type": "interpolation"},
-            "getAngle": {"duration": 800, "type": "interpolation"},
+            "getAngle": {"duration": 600, "type": "interpolation"},
         }
 
-        # Accurate Movement Trail (Only connects actual street travel, resets on teleport)
+        # Accurate Movement Trail (Follows actual street trajectory, resets on jumps)
         if show_trail and target_info:
             trail_coords = tracker.get_trail(target_info["vehicle_id"])
             if len(trail_coords) >= 2:
                 layers.append(pdk.Layer(
                     "PathLayer",
+                    id="motion-trail",
                     data=[{"path": trail_coords}],
                     get_path="path",
                     get_color=[255, 235, 59, 230],
@@ -946,13 +1014,27 @@ def main() -> None:
                     width_max_pixels=6,
                 ))
 
-        # Bus Icons with Directional Rotation (Turns to face left, right, up, down as bus travels)
         if views:
             df_views = pd.DataFrame(views)
 
-            # Layer A: Directional Rotatable Bus Icons
+            # Layer A: Generous Mobile Touch Hit-Target (Enables effortless click & hold on phone screen)
+            layers.append(pdk.Layer(
+                "ScatterplotLayer",
+                id="touch-hitbox",
+                data=df_views,
+                get_position="[lon, lat]",
+                get_fill_color=[0, 0, 0, 1],
+                get_radius=30,
+                radius_min_pixels=28,
+                radius_max_pixels=40,
+                pickable=True,
+                transitions=layer_transitions,
+            ))
+
+            # Layer B: Top-Down Directional Bus Icons (Rotates to every single degree: 0.0 to 360.0)
             layers.append(pdk.Layer(
                 "IconLayer",
+                id="bus-icons",
                 data=df_views,
                 get_icon="icon_spec",
                 get_position="[lon, lat]",
@@ -963,9 +1045,10 @@ def main() -> None:
                 transitions=layer_transitions,
             ))
 
-            # Layer B: High-Visibility Route Badge Floating Right Above the Bus
+            # Layer C: Floating Route Badge Above Each Bus
             layers.append(pdk.Layer(
                 "TextLayer",
+                id="route-labels",
                 data=df_views,
                 get_position="[lon, lat]",
                 get_text="route_short",
@@ -984,6 +1067,7 @@ def main() -> None:
             df_target = pd.DataFrame([{"lat": target_info["lat"], "lon": target_info["lon"]}])
             layers.append(pdk.Layer(
                 "ScatterplotLayer",
+                id="target-reticle",
                 data=df_target,
                 get_position="[lon, lat]",
                 get_fill_color=[255, 235, 59, 35],
@@ -997,11 +1081,12 @@ def main() -> None:
                 transitions=layer_transitions,
             ))
 
-        # My Stop User Marker
+        # My Stop Marker
         if use_my_stop:
             df_stop = pd.DataFrame([{"lat": my_lat, "lon": my_lon, "label": "📍 My Stop"}])
             layers.append(pdk.Layer(
                 "ScatterplotLayer",
+                id="my-stop-pin",
                 data=df_stop,
                 get_position="[lon, lat]",
                 get_fill_color=[0, 229, 255, 220],
@@ -1017,7 +1102,7 @@ def main() -> None:
         # Click & Hold Accurate Tooltip
         map_tooltip = {
             "html": (
-                '<div style="font-family: -apple-system, sans-serif; font-size: 13px; line-height: 1.4; color: #fff; padding: 2px;">'
+                '<div style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; font-size: 13px; line-height: 1.4; color: #fff; padding: 2px;">'
                 '<div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">'
                 '<span style="background: {neon_bg}; color: {neon}; border: 1px solid {neon}; padding: 1px 6px; border-radius: 4px; font-weight: 800; font-size: 12px;">{route}</span>'
                 '<span style="font-family: monospace; font-weight: 700; font-size: 13px; color: #fff;">{vehicle_id}</span>'
@@ -1027,27 +1112,30 @@ def main() -> None:
                 '</div>'
             ),
             "style": {
-                "backgroundColor": "rgba(11, 15, 25, 0.95)",
-                "backdropFilter": "blur(8px)",
-                "border": "1px solid rgba(0, 229, 255, 0.35)",
+                "backgroundColor": "rgba(11, 15, 25, 0.96)",
+                "backdropFilter": "blur(10px)",
+                "border": "1px solid rgba(0, 229, 255, 0.4)",
                 "borderRadius": "8px",
-                "padding": "8px 12px",
-                "boxShadow": "0 8px 24px rgba(0, 0, 0, 0.6)",
+                "padding": "10px 14px",
+                "boxShadow": "0 8px 24px rgba(0, 0, 0, 0.7)",
+                "pointerEvents": "none",
+                "zIndex": "999999",
             },
         }
 
-        # Render PyDeck Map with CARTO Dark Tiles
+        # Render PyDeck Map with CARTO Dark Tiles & Strict/Free Viewport Controller
         st.pydeck_chart(
             pdk.Deck(
                 layers=layers,
-                initial_view_state=st.session_state.view_state,
+                initial_view_state=view_state,
+                views=[map_view],
                 map_style=map_style_url,
                 tooltip=map_tooltip,
             ),
             use_container_width=True,
         )
 
-        # 7. High-Density Active Fleet List (Compact, no div errors, direct 1-tap track)
+        # 8. High-Density Active Fleet List (Compact, 1-tap track)
         st.markdown(f"### 🚍 Active Fleet ({len(views)} Live Buses)")
         if views:
             for b in views:

@@ -1,11 +1,12 @@
 """
 Delhi Transit Radar - Live Bus Fleet Tracking
 Real-time tracking of Delhi public transit buses (Delhi OTD GTFS-realtime).
-Optimized for mobile & desktop with high-contrast neon radar styling.
+Optimized for mobile & desktop with rotatable directional bus icons and high-contrast neon radar styling.
 """
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import math
 import os
@@ -39,7 +40,7 @@ MY_ROUTES = {
         "dir": "Towards Kapashera Border",
         "color": [255, 42, 109],
         "neon": "#FF2A6D",
-        "neon_bg": "rgba(255, 42, 109, 0.18)",
+        "neon_bg": "rgba(255, 42, 109, 0.2)",
         "badge": "🔴",
     },
     "3752": {
@@ -48,7 +49,7 @@ MY_ROUTES = {
         "dir": "Towards Dwarka Mor",
         "color": [255, 42, 109],
         "neon": "#FF2A6D",
-        "neon_bg": "rgba(255, 42, 109, 0.18)",
+        "neon_bg": "rgba(255, 42, 109, 0.2)",
         "badge": "🔴",
     },
     "2804": {
@@ -57,7 +58,7 @@ MY_ROUTES = {
         "dir": "Towards Sector 21",
         "color": [0, 229, 255],
         "neon": "#00E5FF",
-        "neon_bg": "rgba(0, 229, 255, 0.18)",
+        "neon_bg": "rgba(0, 229, 255, 0.2)",
         "badge": "🔵",
     },
     "2801": {
@@ -66,7 +67,7 @@ MY_ROUTES = {
         "dir": "Towards Dwarka Mor",
         "color": [0, 229, 255],
         "neon": "#00E5FF",
-        "neon_bg": "rgba(0, 229, 255, 0.18)",
+        "neon_bg": "rgba(0, 229, 255, 0.2)",
         "badge": "🔵",
     },
     "2179": {
@@ -75,7 +76,7 @@ MY_ROUTES = {
         "dir": "Towards Kapashera Border",
         "color": [0, 255, 102],
         "neon": "#00FF66",
-        "neon_bg": "rgba(0, 255, 102, 0.18)",
+        "neon_bg": "rgba(0, 255, 102, 0.2)",
         "badge": "🟢",
     },
     "2176": {
@@ -84,14 +85,14 @@ MY_ROUTES = {
         "dir": "Towards Uttam Nagar",
         "color": [0, 255, 102],
         "neon": "#00FF66",
-        "neon_bg": "rgba(0, 255, 102, 0.18)",
+        "neon_bg": "rgba(0, 255, 102, 0.2)",
         "badge": "🟢",
     },
 }
 ROUTE_NAMES = sorted({v["route"] for v in MY_ROUTES.values()})
 
 # Default map view focused on South-West Delhi corridor
-DEFAULT_VIEW = dict(latitude=28.5800, longitude=77.0500, zoom=12.2)
+DEFAULT_VIEW = dict(latitude=28.5800, longitude=77.0500, zoom=12.4)
 
 # Free public CARTO vector basemap styles (Zero Mapbox token required)
 CARTO_DARK = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
@@ -99,26 +100,68 @@ CARTO_LIGHT = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 
 # Physics / telemetry thresholds
 MOVING_KMH = 3.0
-JITTER_M = 6.0
-TRAIL_MIN_M = 8.0
-MAX_SANE_KMH = 110.0
+JITTER_M = 5.0
+TRAIL_MIN_M = 15.0
+TRAIL_MAX_GAP_M = 350.0  # Reset trail if jump exceeds 350m to avoid chords cutting across city
+MAX_SANE_KMH = 105.0
 MAX_DT_FOR_SPEED_S = 180
 SPEED_HOLD_S = 60
 STALE_S = 180
 STALE_NO_TS_S = 900
-TRAIL_POINTS = 45
+TRAIL_POINTS = 35
 
-# Offline detection
+# Network caching & timing
+FETCH_TTL_S = 3  # Fast 3s cache for immediate location synchronization
 OFFLINE_MISSING_SNAPSHOTS = 3
 OFFLINE_GRACE_S = 45
-OFFLINE_KEEP_S = 6 * 3600
-FETCH_TTL_S = 4
+OFFLINE_KEEP_S = 4 * 3600
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30), "IST")
 
 
 # =============================================================================
-# 2. HELPER FUNCTIONS
+# 2. DIRECTIONAL SVG BUS ICON GENERATOR
+# =============================================================================
+
+def generate_bus_svg_icon(color_hex: str) -> dict:
+    """
+    Generates a top-down transit bus SVG icon pointing North (0 degrees).
+    When Deck.gl applies get_angle="bearing", the bus icon rotates smoothly
+    to face the exact direction of travel (North, South, East, West, etc.).
+    """
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+  <rect x="14" y="6" width="32" height="48" rx="8" fill="{color_hex}" fill-opacity="0.25"/>
+  <rect x="16" y="8" width="28" height="44" rx="7" fill="#0b1120" stroke="{color_hex}" stroke-width="2.5"/>
+  <circle cx="19.5" cy="10" r="2.2" fill="#ffffff"/>
+  <circle cx="40.5" cy="10" r="2.2" fill="#ffffff"/>
+  <path d="M20 13.5 Q30 12 40 13.5 L39.5 20.5 Q30 21.5 20.5 20.5 Z" fill="{color_hex}" fill-opacity="0.95"/>
+  <polygon points="30,24 24,34 30,31.5 36,34" fill="{color_hex}"/>
+  <rect x="17" y="24" width="2.5" height="5.5" rx="1" fill="#64748b"/>
+  <rect x="40.5" y="24" width="2.5" height="5.5" rx="1" fill="#64748b"/>
+  <rect x="17" y="33" width="2.5" height="5.5" rx="1" fill="#64748b"/>
+  <rect x="40.5" y="33" width="2.5" height="5.5" rx="1" fill="#64748b"/>
+  <rect x="18" y="50" width="4.5" height="2" rx="1" fill="#ef4444"/>
+  <rect x="37.5" y="50" width="4.5" height="2" rx="1" fill="#ef4444"/>
+</svg>"""
+    b64 = base64.b64encode(svg.encode("utf-8")).decode("utf-8")
+    return {
+        "url": f"data:image/svg+xml;base64,{b64}",
+        "width": 60,
+        "height": 60,
+        "anchorX": 30,
+        "anchorY": 30,
+    }
+
+# Pre-generate self-contained vector icons for zero network latency & no CORS
+BUS_ICONS = {
+    "#00FF66": generate_bus_svg_icon("#00FF66"),  # Route 718 (Neon Green)
+    "#00E5FF": generate_bus_svg_icon("#00E5FF"),  # Route D-068 (Neon Blue)
+    "#FF2A6D": generate_bus_svg_icon("#FF2A6D"),  # Route D-9919 (Neon Red)
+}
+
+
+# =============================================================================
+# 3. HELPER FUNCTIONS & GEOMETRY
 # =============================================================================
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -128,6 +171,16 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlmb = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
     return 2 * 6371000.0 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def calc_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Computes the forward azimuth compass heading in degrees from point 1 to point 2."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon)
+    initial_bearing = math.degrees(math.atan2(y, x))
+    return (initial_bearing + 360.0) % 360.0
 
 
 def fmt_ist(ts: float | None) -> str:
@@ -145,14 +198,6 @@ def format_duration(seconds: float) -> str:
     if m:
         return f"{m}m {sec:02d}s"
     return f"{sec}s"
-
-
-def compass(bearing: float | None) -> str:
-    if bearing is None:
-        return "-"
-    names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-    idx = int(((bearing % 360) + 22.5) // 45) % 8
-    return f"{names[idx]} ({int(bearing) % 360}°)"
 
 
 def effective_speed(feed_kmh: float | None, calc_kmh: float) -> float:
@@ -183,12 +228,12 @@ def fit_view(points: list[tuple[float, float]], fallback: pdk.ViewState) -> pdk.
     zoom_lat = math.log2(280.0 / (lat_span * 1.35))
     zoom_lon = math.log2(420.0 / (lon_span * 1.35))
     zoom = min(zoom_lat, zoom_lon)
-    zoom = max(10.8, min(15.2, zoom))
+    zoom = max(11.0, min(15.2, zoom))
     return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=round(zoom, 2), pitch=0, bearing=0)
 
 
 # =============================================================================
-# 3. NETWORK INGESTION LAYER
+# 4. NETWORK INGESTION LAYER
 # =============================================================================
 
 class FeedError(Exception):
@@ -213,7 +258,7 @@ def get_http_session() -> requests.Session:
 def fetch_feed(api_key: str) -> dict:
     session = get_http_session()
     try:
-        resp = session.get(FEED_URL, params={"key": api_key}, headers=HTTP_HEADERS, timeout=(3.5, 8))
+        resp = session.get(FEED_URL, params={"key": api_key}, headers=HTTP_HEADERS, timeout=(3.5, 7.5))
     except requests.exceptions.Timeout:
         raise FeedError("Request timed out - OTD server unresponsive") from None
     except requests.exceptions.ConnectionError:
@@ -303,7 +348,7 @@ def fetch_feed(api_key: str) -> dict:
 
 
 # =============================================================================
-# 4. FLEET TRACKER & TELEMETRY ENGINE
+# 5. FLEET TRACKER & TELEMETRY ENGINE
 # =============================================================================
 
 class FleetTracker:
@@ -346,6 +391,8 @@ class FleetTracker:
         self.offline.pop(vid, None)
         st_ = self.buses.get(vid)
 
+        bearing = rec["bearing"] if rec["bearing"] is not None and rec["bearing"] > 0 else 0.0
+
         if st_ is None:
             fix_time = rec["ts"] if has_ts else wall
             feed_kmh = rec["speed_ms"] * 3.6 if rec["speed_ms"] is not None else None
@@ -361,7 +408,7 @@ class FleetTracker:
                 "color": info["color"],
                 "lat": rec["lat"],
                 "lon": rec["lon"],
-                "bearing": rec["bearing"],
+                "bearing": bearing,
                 "fix_time": fix_time,
                 "has_ts": has_ts,
                 "last_seen": wall,
@@ -398,10 +445,14 @@ class FleetTracker:
             is_new = moved_m > 0.5
             fix_time = wall if is_new else st_["fix_time"]
 
+        # Calculate accurate heading if bus moved
+        if rec["bearing"] is not None and rec["bearing"] > 0:
+            st_["bearing"] = rec["bearing"]
+        elif moved_m >= JITTER_M:
+            st_["bearing"] = calc_bearing(st_["lat"], st_["lon"], rec["lat"], rec["lon"])
+
         if rec["speed_ms"] is not None:
             st_["speed_feed"] = rec["speed_ms"] * 3.6
-        if rec["bearing"] is not None:
-            st_["bearing"] = rec["bearing"]
         if not is_new:
             return
 
@@ -420,8 +471,12 @@ class FleetTracker:
             prev = st_["speed_calc"]
             st_["speed_calc"] = derived if (derived == 0.0 or prev <= 0.0) else 0.6 * derived + 0.4 * prev
 
+        # Trail filtering: only append real travel, reset if teleport / jump > 350m
         if moved_m >= TRAIL_MIN_M:
+            if moved_m > TRAIL_MAX_GAP_M:
+                st_["trail"].clear()
             st_["trail"].append((rec["lon"], rec["lat"]))
+
         st_["lat"], st_["lon"] = rec["lat"], rec["lon"]
         st_["fix_time"] = fix_time
 
@@ -469,33 +524,20 @@ class FleetTracker:
 
                 if stale:
                     state = "stale"
-                    state_label = "No GPS"
-                    status_text = f"📡 No GPS Signal ({format_duration(age)} ago)"
                     status_short = "📡 No GPS"
-                    # Muted grey marker
-                    halo_color = [148, 163, 184, 50]
-                    core_color = [71, 85, 105, 180]
-                    stroke_color = [148, 163, 184, 210]
+                    status_text = "📡 Stale GPS Fix"
                 elif speed >= MOVING_KMH:
                     state = "moving"
-                    state_label = "Moving"
-                    status_text = "🟢 In Transit"
                     status_short = f"🟢 {speed:.1f} km/h"
-                    # Bright glowing neon marker
-                    halo_color = list(b["color"]) + [65]
-                    core_color = list(b["color"]) + [225]
-                    stroke_color = [255, 255, 255, 255]
+                    status_text = f"🟢 Moving ({speed:.1f} km/h)"
                 else:
                     since = b["stop_since"] if b["stop_since"] is not None else b["fix_time"]
                     stop_dur = format_duration(now - since)
                     state = "stopped"
-                    state_label = "Stopped"
-                    status_text = f"🛑 Stopped ({stop_dur})"
                     status_short = f"🛑 Stopped ({stop_dur})"
-                    # Warm warning amber halo with route core
-                    halo_color = [255, 171, 0, 70]
-                    core_color = list(b["color"]) + [190]
-                    stroke_color = [255, 171, 0, 240]
+                    status_text = f"🛑 Stopped for {stop_dur}"
+
+                icon_spec = BUS_ICONS.get(b["neon"], BUS_ICONS["#00E5FF"])
 
                 out.append({
                     "vehicle_id": b["vehicle_id"],
@@ -506,18 +548,15 @@ class FleetTracker:
                     "neon": b["neon"],
                     "neon_bg": b["neon_bg"],
                     "color": list(b["color"]),
-                    "halo_color": halo_color,
-                    "core_color": core_color,
-                    "stroke_color": stroke_color,
                     "lat": b["lat"],
                     "lon": b["lon"],
                     "speed_kmh": round(speed, 1),
                     "state": state,
-                    "state_label": state_label,
-                    "status_text": status_text,
                     "status_short": status_short,
+                    "status_text": status_text,
                     "bearing": b["bearing"],
-                    "heading": compass(b["bearing"]),
+                    "bearing_angle": float(b.get("bearing", 0.0) or 0.0),
+                    "icon_spec": icon_spec,
                     "age_s": age,
                     "age_text": f"{format_duration(age)} ago",
                     "last_fix_ist": fmt_ist(b["fix_time"]),
@@ -528,10 +567,6 @@ class FleetTracker:
         with self.lock:
             b = self.buses.get(vid)
             return [list(p) for p in b["trail"]] if b else []
-
-    def get_offline(self, now: float) -> list[dict]:
-        with self.lock:
-            return [dict(o, offline_for=now - o["last_seen"]) for o in self.offline.values()]
 
     def get_health(self) -> dict:
         with self.lock:
@@ -551,14 +586,14 @@ def get_tracker() -> FleetTracker:
 
 
 # =============================================================================
-# 5. UI & STYLING ENGINE
+# 6. UI & MOBILE STYLING
 # =============================================================================
 
 CUSTOM_CSS = """
 <style>
-/* Global Clean Dark Theme */
+/* Clean dark transit theme */
 .stApp {
-    background-color: #0b0f19;
+    background-color: #080d1a;
     color: #f1f5f9;
 }
 header[data-testid="stHeader"] {
@@ -566,195 +601,155 @@ header[data-testid="stHeader"] {
 }
 
 /* App Header */
-.app-title-bar {
+.app-header-strip {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 6px 0 10px 0;
+    padding: 2px 0 6px 0;
+    margin-bottom: 6px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    margin-bottom: 12px;
 }
-.app-brand {
-    font-size: 1.45rem;
+.app-brand-title {
+    font-size: 1.25rem;
     font-weight: 800;
     letter-spacing: -0.5px;
     background: linear-gradient(90deg, #00E5FF, #00FF66);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
 }
-.feed-badge {
-    font-size: 0.75rem;
+.app-feed-meta {
+    font-size: 0.72rem;
     color: #94a3b8;
     background: rgba(255, 255, 255, 0.05);
-    padding: 4px 10px;
-    border-radius: 20px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-/* Mobile-First Responsive Metrics Grid */
-.metrics-grid {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 8px;
-    margin: 8px 0 14px 0;
-}
-@media (max-width: 640px) {
-    .metrics-grid {
-        grid-template-columns: repeat(3, 1fr);
-    }
-}
-.metric-card {
-    background: rgba(18, 24, 38, 0.85);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 3px 8px;
     border-radius: 12px;
-    padding: 10px 8px;
-    text-align: center;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
-    backdrop-filter: blur(10px);
 }
-.metric-num {
-    font-size: 1.4rem;
-    font-weight: 800;
-    line-height: 1.1;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-.metric-label {
-    font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    color: #94a3b8;
-    margin-top: 3px;
-    font-weight: 600;
-}
-.card-active .metric-num { color: #00E5FF; text-shadow: 0 0 12px rgba(0, 229, 255, 0.4); }
-.card-moving .metric-num { color: #00FF66; text-shadow: 0 0 12px rgba(0, 255, 102, 0.4); }
-.card-stopped .metric-num { color: #FFAB00; }
-.card-stale .metric-num { color: #94A3B8; }
-.card-offline .metric-num { color: #FF2A6D; }
 
-/* Selected Bus Telemetry HUD Card */
-.hud-card {
-    background: linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(24, 33, 53, 0.9));
-    border: 1px solid rgba(0, 229, 255, 0.35);
-    border-radius: 14px;
-    padding: 12px 14px;
-    margin: 10px 0 14px 0;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5), inset 0 0 15px rgba(0, 229, 255, 0.06);
-}
-.hud-header {
+/* Compact 3-Pill Stats Bar (Active, Moving, Stopped) */
+.stats-strip {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    flex-wrap: wrap;
     gap: 8px;
-    margin-bottom: 10px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    margin: 4px 0 8px 0;
 }
-.hud-title-box {
+.stat-pill {
+    flex: 1;
+    background: rgba(18, 26, 43, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 6px 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+.stat-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+}
+.dot-active { background: #00E5FF; box-shadow: 0 0 6px #00E5FF; }
+.dot-moving { background: #00FF66; box-shadow: 0 0 6px #00FF66; }
+.dot-stopped { background: #FFAB00; box-shadow: 0 0 6px #FFAB00; }
+.stat-val {
+    font-size: 1.05rem;
+    font-weight: 800;
+    line-height: 1;
+}
+.stat-lbl {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: #94a3b8;
+}
+.stat-active .stat-val { color: #00E5FF; }
+.stat-moving .stat-val { color: #00FF66; }
+.stat-stopped .stat-val { color: #FFAB00; }
+
+/* Compact Tracking HUD Card */
+.hud-strip {
+    background: linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(24, 33, 53, 0.9));
+    border: 1px solid rgba(0, 229, 255, 0.35);
+    border-radius: 10px;
+    padding: 8px 12px;
+    margin: 6px 0 10px 0;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.hud-top-line {
     display: flex;
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+    margin-bottom: 6px;
 }
 .route-badge {
-    padding: 4px 10px;
-    border-radius: 6px;
+    padding: 2px 8px;
+    border-radius: 5px;
     font-weight: 800;
-    font-size: 0.88rem;
+    font-size: 0.82rem;
     letter-spacing: 0.5px;
-    display: inline-block;
 }
 .plate-num {
     font-family: monospace;
-    font-size: 1.05rem;
+    font-size: 1rem;
     font-weight: 800;
     color: #ffffff;
-    letter-spacing: 0.5px;
 }
-.direction-sub {
-    font-size: 0.82rem;
+.dir-sub {
+    font-size: 0.8rem;
     color: #94a3b8;
 }
-.hud-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(75px, 1fr));
-    gap: 8px;
-    text-align: center;
-}
-.hud-item {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    border-radius: 8px;
-    padding: 6px 4px;
-}
-.hud-val {
-    display: block;
-    font-size: 1.05rem;
-    font-weight: 800;
-    color: #f8fafc;
-}
-.hud-lbl {
-    display: block;
-    font-size: 0.62rem;
-    color: #64748b;
-    text-transform: uppercase;
-    font-weight: 700;
-    letter-spacing: 0.4px;
-    margin-top: 2px;
-}
-
-/* Bus Card in Fleet List */
-.bus-item-card {
-    background: rgba(18, 24, 38, 0.8);
-    border: 1px solid rgba(255, 255, 255, 0.07);
-    border-radius: 12px;
-    padding: 12px 14px;
-    margin-bottom: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 10px;
-    transition: transform 0.15s ease, border-color 0.15s ease;
-}
-.bus-item-card.is-tracked {
-    border-color: #00E5FF;
-    background: rgba(0, 229, 255, 0.05);
-    box-shadow: 0 0 16px rgba(0, 229, 255, 0.18);
-}
-.bus-left-meta {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
-.bus-top-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-}
-.bus-right-tele {
+.hud-metrics-row {
     display: flex;
     align-items: center;
     gap: 12px;
     flex-wrap: wrap;
-}
-.status-pill {
-    padding: 3px 8px;
-    border-radius: 20px;
-    font-size: 0.75rem;
+    font-size: 0.85rem;
     font-weight: 700;
 }
-.status-pill-moving { background: rgba(0, 255, 102, 0.15); color: #00FF66; }
-.status-pill-stopped { background: rgba(255, 171, 0, 0.15); color: #FFAB00; }
-.status-pill-stale { background: rgba(148, 163, 184, 0.15); color: #94A3B8; }
+.speed-tag { color: #00E5FF; }
 
-/* Custom Streamlit adjustments */
-div[data-testid="stExpander"] {
-    background-color: rgba(18, 24, 38, 0.6) !important;
-    border: 1px solid rgba(255, 255, 255, 0.08) !important;
-    border-radius: 10px !important;
+/* High-Density Fleet Row */
+.fleet-row-card {
+    background: rgba(18, 26, 43, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.fleet-row-card.is-active-target {
+    border-color: #00E5FF;
+    background: rgba(0, 229, 255, 0.08);
+}
+.fleet-meta-left {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex-wrap: wrap;
+    overflow: hidden;
+}
+.fleet-status-pill {
+    padding: 2px 6px;
+    border-radius: 10px;
+    font-size: 0.72rem;
+    font-weight: 700;
+}
+.pill-moving { background: rgba(0, 255, 102, 0.15); color: #00FF66; }
+.pill-stopped { background: rgba(255, 171, 0, 0.15); color: #FFAB00; }
+.pill-stale { background: rgba(148, 163, 184, 0.15); color: #94A3B8; }
+
+/* Small buttons styling */
+div[data-testid="stButton"] > button {
+    border-radius: 6px !important;
+    padding: 3px 8px !important;
+    font-size: 0.8rem !important;
+    font-weight: 600 !important;
+    min-height: 32px !important;
 }
 </style>
 """
@@ -783,7 +778,7 @@ def rerun_fragment() -> None:
 
 
 # =============================================================================
-# 6. MAIN APPLICATION
+# 7. MAIN APPLICATION
 # =============================================================================
 
 def main() -> None:
@@ -805,19 +800,18 @@ def main() -> None:
 
     lock_camera = sb.toggle("🔒 Camera Lock on Bus", value=True,
                             help="Automatically keeps the tracked vehicle centered in view.")
-    follow_zoom = sb.slider("Tracking Zoom", 11.5, 17.5, 14.5, 0.5)
+    follow_zoom = sb.slider("Tracking Zoom", 12.0, 17.0, 14.8, 0.2)
     show_trail = sb.toggle("🧵 Show Movement Trail", value=True)
-    show_offline_pins = sb.toggle("👻 Show Last Offline Positions", value=False)
 
     sb.divider()
     sb.markdown("### ⏱️ Refresh Rate")
     auto_refresh = sb.toggle("Live Auto-Refresh", value=True)
-    refresh_rate = int(sb.number_input("Interval (seconds):", min_value=2, max_value=60, value=5))
+    refresh_rate = int(sb.number_input("Interval (seconds):", min_value=2, max_value=60, value=4))
     if sb.button("🔄 Refresh Now", use_container_width=True):
         st.rerun()
 
     sb.divider()
-    sb.markdown("### 📍 My Bus Stop (Optional)")
+    sb.markdown("### 📍 My Stop (Optional)")
     use_my_stop = sb.toggle("Calculate Distance to My Stop", value=False)
     my_lat = sb.number_input("Latitude", value=28.6190, format="%.5f", disabled=not use_my_stop)
     my_lon = sb.number_input("Longitude", value=77.0321, format="%.5f", disabled=not use_my_stop)
@@ -855,9 +849,6 @@ def main() -> None:
         views = [v for v in all_views if selected_route in ("All Routes", v["route"])]
         views.sort(key=lambda v: (v["route"], v["direction"], v["vehicle_id"]))
 
-        offline = [o for o in tracker.get_offline(now) if selected_route in ("All Routes", o["route"])]
-        offline.sort(key=lambda o: o["last_seen"], reverse=True)
-
         # Distance calculation
         if use_my_stop:
             for v in views:
@@ -865,137 +856,59 @@ def main() -> None:
 
         # 2. Header Bar
         last_time_str = fmt_ist(health["last_ok_wall"]) if health["last_ok_wall"] else "Connecting..."
-        feed_info = f"{health['total_feed_vehicles']} buses in Delhi feed" if health['total_feed_vehicles'] else "Live Radar"
-        st.markdown(
-            f"""
-            <div class="app-title-bar">
-                <div class="app-brand">🚍 Delhi Transit Radar</div>
-                <div class="feed-badge">Updated {last_time_str} IST · {feed_info}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        feed_info = f"{health['total_feed_vehicles']} buses in Delhi" if health['total_feed_vehicles'] else "Live Radar"
+        header_html = (
+            f'<div class="app-header-strip">'
+            f'<div class="app-brand-title">🚍 Delhi Transit Radar</div>'
+            f'<div class="app-feed-meta">Updated {last_time_str} IST · {feed_info}</div>'
+            f'</div>'
         )
+        st.markdown(header_html, unsafe_allow_html=True)
 
         if health["last_error"]:
             st.warning(f"⚠️ Feed connection alert: {health['last_error']}. Showing last available data.")
 
-        # 3. Responsive Metrics Bar (Mobile & Desktop Friendly)
+        # 3. Compact 3-Pill Stats Bar (Active, Moving, Stopped - No GPS & Offline removed as requested)
         n_move = sum(v["state"] == "moving" for v in views)
         n_stop = sum(v["state"] == "stopped" for v in views)
-        n_stale = sum(v["state"] == "stale" for v in views)
-        st.markdown(
-            f"""
-            <div class="metrics-grid">
-                <div class="metric-card card-active">
-                    <div class="metric-num">{len(views)}</div>
-                    <div class="metric-label">Active</div>
-                </div>
-                <div class="metric-card card-moving">
-                    <div class="metric-num">{n_move}</div>
-                    <div class="metric-label">Moving</div>
-                </div>
-                <div class="metric-card card-stopped">
-                    <div class="metric-num">{n_stop}</div>
-                    <div class="metric-label">Stopped</div>
-                </div>
-                <div class="metric-card card-stale">
-                    <div class="metric-num">{n_stale}</div>
-                    <div class="metric-label">No GPS</div>
-                </div>
-                <div class="metric-card card-offline">
-                    <div class="metric-num">{len(offline)}</div>
-                    <div class="metric-label">Offline</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        stats_html = (
+            f'<div class="stats-strip">'
+            f'<div class="stat-pill stat-active"><span class="stat-dot dot-active"></span><span class="stat-val">{len(views)}</span><span class="stat-lbl">Active</span></div>'
+            f'<div class="stat-pill stat-moving"><span class="stat-dot dot-moving"></span><span class="stat-val">{n_move}</span><span class="stat-lbl">Moving</span></div>'
+            f'<div class="stat-pill stat-stopped"><span class="stat-dot dot-stopped"></span><span class="stat-val">{n_stop}</span><span class="stat-lbl">Stopped</span></div>'
+            f'</div>'
         )
+        st.markdown(stats_html, unsafe_allow_html=True)
 
-        # 4. Bus Tracking Selector (Clean Dropdown + Quick Selector)
         target_id = st.session_state.target_bus
         target_info = next((v for v in views if v["vehicle_id"] == target_id), None) if target_id != "None" else None
 
-        # Build options for dropdown
-        bus_options = ["None"] + [v["vehicle_id"] for v in views]
-        def format_bus_label(vid: str) -> str:
-            if vid == "None":
-                return "🌐 Free Roam (Show All Buses)"
-            b = next((v for v in views if v["vehicle_id"] == vid), None)
-            if not b:
-                return vid
-            return f"{b['badge']} {b['route']} • {b['vehicle_id']} ➔ {b['direction']} ({b['speed_kmh']} km/h)"
-
-        current_idx = bus_options.index(target_id) if target_id in bus_options else 0
-        col_sel, col_btn = st.columns([4, 1])
-        with col_sel:
-            chosen = st.selectbox(
-                "🎯 Focus & Track Specific Vehicle:",
-                bus_options,
-                index=current_idx,
-                format_func=format_bus_label,
-                label_visibility="collapsed",
-            )
-            if chosen != target_id:
-                st.session_state.target_bus = chosen
-                rerun_fragment()
-
-        with col_btn:
-            if target_id != "None":
-                if st.button("✕ Reset Roam", use_container_width=True):
+        # 4. Telemetry HUD for Selected Bus (Compact & clean, Compass and Last Fix removed as requested)
+        if target_info:
+            dist_txt = f'<span style="color:#00E5FF;">📍 {target_info["dist_km"]} km to stop</span>' if (use_my_stop and "dist_km" in target_info) else ""
+            hud_col_info, hud_col_btn = st.columns([4, 1.2], vertical_alignment="center")
+            with hud_col_info:
+                hud_html = (
+                    f'<div class="hud-strip">'
+                    f'<div class="hud-top-line">'
+                    f'<span class="route-badge" style="background:{target_info["neon_bg"]};color:{target_info["neon"]};border:1px solid {target_info["neon"]};">{target_info["route"]}</span>'
+                    f'<span class="plate-num">{target_info["vehicle_id"]}</span>'
+                    f'<span class="dir-sub">➔ {target_info["direction"]}</span>'
+                    f'</div>'
+                    f'<div class="hud-metrics-row">'
+                    f'<span class="speed-tag">⚡ {target_info["speed_kmh"]} km/h</span>'
+                    f'<span>{target_info["status_short"]}</span>'
+                    f'{dist_txt}'
+                    f'</div>'
+                    f'</div>'
+                )
+                st.markdown(hud_html, unsafe_allow_html=True)
+            with hud_col_btn:
+                if st.button("✕ Free Roam", key="release_hud_btn", use_container_width=True):
                     st.session_state.target_bus = "None"
                     rerun_fragment()
 
-        # 5. Selected Bus Telemetry HUD
-        if target_info:
-            dist_html = ""
-            if use_my_stop and "dist_km" in target_info:
-                dist_html = f"""
-                <div class="hud-item">
-                    <span class="hud-val" style="color: #00E5FF;">{target_info['dist_km']} <small>km</small></span>
-                    <span class="hud-lbl">📍 TO STOP</span>
-                </div>
-                """
-
-            st.markdown(
-                f"""
-                <div class="hud-card">
-                    <div class="hud-header">
-                        <div class="hud-title-box">
-                            <span class="route-badge" style="background: {target_info['neon_bg']}; color: {target_info['neon']}; border: 1px solid {target_info['neon']}; box-shadow: 0 0 10px {target_info['neon_bg']};">
-                                {target_info['route']}
-                            </span>
-                            <span class="plate-num">{target_info['vehicle_id']}</span>
-                            <span class="direction-sub">➔ {target_info['direction']}</span>
-                        </div>
-                        <div style="font-weight: 700; font-size: 0.85rem; color: #f8fafc;">
-                            {target_info['status_short']}
-                        </div>
-                    </div>
-                    <div class="hud-grid">
-                        <div class="hud-item">
-                            <span class="hud-val">{target_info['speed_kmh']} <small>km/h</small></span>
-                            <span class="hud-lbl">⚡ SPEED</span>
-                        </div>
-                        <div class="hud-item">
-                            <span class="hud-val">{target_info['state_label']}</span>
-                            <span class="hud-lbl">🚦 STATE</span>
-                        </div>
-                        <div class="hud-item">
-                            <span class="hud-val">{target_info['heading']}</span>
-                            <span class="hud-lbl">🧭 COMPASS</span>
-                        </div>
-                        <div class="hud-item">
-                            <span class="hud-val">{target_info['age_text']}</span>
-                            <span class="hud-lbl">⏱️ LAST FIX</span>
-                        </div>
-                        {dist_html}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        # 6. Map Camera Position Calculation
+        # 5. Camera View State Calculation
         if target_info and lock_camera:
             st.session_state.view_state = pdk.ViewState(
                 latitude=target_info["lat"],
@@ -1010,10 +923,16 @@ def main() -> None:
                 st.session_state.view_state,
             )
 
-        # 7. PyDeck Radar Map Layers
+        # 6. PyDeck Radar Map Layers (Rotatable Bus Icons + Smooth Vertex Transitions)
         layers = []
 
-        # Motion trail for tracked bus
+        # Smooth WebGL Transitions (Slides position smoothly across updates without teleporting)
+        layer_transitions = {
+            "getPosition": {"duration": 2200, "type": "interpolation"},
+            "getAngle": {"duration": 800, "type": "interpolation"},
+        }
+
+        # Accurate Movement Trail (Only connects actual street travel, resets on teleport)
         if show_trail and target_info:
             trail_coords = tracker.get_trail(target_info["vehicle_id"])
             if len(trail_coords) >= 2:
@@ -1027,59 +946,24 @@ def main() -> None:
                     width_max_pixels=6,
                 ))
 
-        # Offline bus markers (if enabled)
-        if show_offline_pins and offline:
-            df_offline = pd.DataFrame(offline)
-            layers.append(pdk.Layer(
-                "ScatterplotLayer",
-                data=df_offline,
-                get_position="[lon, lat]",
-                get_fill_color=[120, 120, 120, 90],
-                get_line_color=[180, 180, 180, 150],
-                line_width_min_pixels=1,
-                get_radius=12,
-                radius_min_pixels=6,
-                radius_max_pixels=12,
-                stroked=True,
-                filled=True,
-            ))
-
-        # Active Buses Layers (Outer Neon Pulse + Solid Core + Route Text)
+        # Bus Icons with Directional Rotation (Turns to face left, right, up, down as bus travels)
         if views:
             df_views = pd.DataFrame(views)
 
-            # Layer A: Glowing Outer Radar Pulse
+            # Layer A: Directional Rotatable Bus Icons
             layers.append(pdk.Layer(
-                "ScatterplotLayer",
+                "IconLayer",
                 data=df_views,
+                get_icon="icon_spec",
                 get_position="[lon, lat]",
-                get_fill_color="halo_color",
-                get_line_color="stroke_color",
-                line_width_min_pixels=2,
-                get_radius=22,
-                radius_min_pixels=14,
-                radius_max_pixels=24,
-                stroked=True,
-                filled=True,
+                get_size=36,
+                get_angle="bearing_angle",
+                size_scale=1,
                 pickable=True,
+                transitions=layer_transitions,
             ))
 
-            # Layer B: Inner Core
-            layers.append(pdk.Layer(
-                "ScatterplotLayer",
-                data=df_views,
-                get_position="[lon, lat]",
-                get_fill_color="core_color",
-                get_line_color="stroke_color",
-                line_width_min_pixels=2,
-                get_radius=11,
-                radius_min_pixels=8,
-                radius_max_pixels=13,
-                stroked=True,
-                filled=True,
-            ))
-
-            # Layer C: Crisp Route Label
+            # Layer B: High-Visibility Route Badge Floating Right Above the Bus
             layers.append(pdk.Layer(
                 "TextLayer",
                 data=df_views,
@@ -1089,26 +973,28 @@ def main() -> None:
                 get_size=11,
                 get_alignment_baseline="'center'",
                 get_text_anchor="'middle'",
-                get_pixel_offset=[0, -22],
+                get_pixel_offset=[0, -26],
                 background=True,
-                get_background_color=[15, 23, 42, 220],
+                get_background_color=[11, 15, 25, 220],
+                transitions=layer_transitions,
             ))
 
-        # Target Bus Radar Reticle / Lock Ring
+        # Target Radar Ring (Centered on tracked bus)
         if target_info:
             df_target = pd.DataFrame([{"lat": target_info["lat"], "lon": target_info["lon"]}])
             layers.append(pdk.Layer(
                 "ScatterplotLayer",
                 data=df_target,
                 get_position="[lon, lat]",
-                get_fill_color=[255, 235, 59, 45],
+                get_fill_color=[255, 235, 59, 35],
                 get_line_color=[255, 235, 59, 255],
                 line_width_min_pixels=3,
-                get_radius=32,
-                radius_min_pixels=24,
-                radius_max_pixels=38,
+                get_radius=30,
+                radius_min_pixels=22,
+                radius_max_pixels=36,
                 stroked=True,
                 filled=True,
+                transitions=layer_transitions,
             ))
 
         # My Stop User Marker
@@ -1128,30 +1014,29 @@ def main() -> None:
                 filled=True,
             ))
 
-        # Interactive Map Tooltip
+        # Click & Hold Accurate Tooltip
         map_tooltip = {
-            "html": """
-            <div style="font-family: -apple-system, sans-serif; font-size: 13px; line-height: 1.4; color: #fff; padding: 2px;">
-                <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">
-                    <b style="font-size: 14px; color: {neon};">{route}</b>
-                    <span style="background: rgba(255,255,255,0.15); padding: 1px 6px; border-radius: 4px; font-size: 11px; font-family: monospace;">{vehicle_id}</span>
-                </div>
-                <div style="color: #cbd5e1; font-size: 12px; margin-bottom: 4px;">🏁 {direction}</div>
-                <div style="font-weight: 600; color: #f8fafc;">⚡ {speed_kmh} km/h · {status_text}</div>
-                <div style="color: #94a3b8; font-size: 11px; margin-top: 2px;">⏱️ Fix: {last_fix_ist} ({age_text})</div>
-            </div>
-            """,
+            "html": (
+                '<div style="font-family: -apple-system, sans-serif; font-size: 13px; line-height: 1.4; color: #fff; padding: 2px;">'
+                '<div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">'
+                '<span style="background: {neon_bg}; color: {neon}; border: 1px solid {neon}; padding: 1px 6px; border-radius: 4px; font-weight: 800; font-size: 12px;">{route}</span>'
+                '<span style="font-family: monospace; font-weight: 700; font-size: 13px; color: #fff;">{vehicle_id}</span>'
+                '</div>'
+                '<div style="color: #cbd5e1; font-size: 12px; margin-bottom: 3px;">🏁 <b>{direction}</b></div>'
+                '<div style="font-weight: 700; color: #00E5FF; font-size: 12px;">⚡ {speed_kmh} km/h · {status_short}</div>'
+                '</div>'
+            ),
             "style": {
-                "backgroundColor": "rgba(15, 23, 42, 0.94)",
+                "backgroundColor": "rgba(11, 15, 25, 0.95)",
                 "backdropFilter": "blur(8px)",
-                "border": "1px solid rgba(255, 255, 255, 0.15)",
+                "border": "1px solid rgba(0, 229, 255, 0.35)",
                 "borderRadius": "8px",
                 "padding": "8px 12px",
-                "boxShadow": "0 8px 24px rgba(0,0,0,0.5)",
+                "boxShadow": "0 8px 24px rgba(0, 0, 0, 0.6)",
             },
         }
 
-        # Render Deck Map with free CARTO Vector Tiles
+        # Render PyDeck Map with CARTO Dark Tiles
         st.pydeck_chart(
             pdk.Deck(
                 layers=layers,
@@ -1162,61 +1047,38 @@ def main() -> None:
             use_container_width=True,
         )
 
-        # 8. Live Active Fleet Cards (Clean, Highlighted with Neon Colors)
+        # 7. High-Density Active Fleet List (Compact, no div errors, direct 1-tap track)
         st.markdown(f"### 🚍 Active Fleet ({len(views)} Live Buses)")
         if views:
             for b in views:
                 is_this_tracked = (b["vehicle_id"] == target_id)
-                card_class = "bus-item-card is-tracked" if is_this_tracked else "bus-item-card"
+                card_active_class = "is-active-target" if is_this_tracked else ""
+                pill_class = f"pill-{b['state']}"
 
-                # Status pill style
-                pill_class = f"status-pill status-pill-{b['state']}"
+                dist_text = f"<span style='color:#00E5FF; font-weight:700; font-size:0.75rem;'>📍 {b['dist_km']} km</span>" if (use_my_stop and "dist_km" in b) else ""
 
-                dist_badge = ""
-                if use_my_stop and "dist_km" in b:
-                    dist_badge = f"<span style='color: #00E5FF; font-weight: 700; font-size: 0.8rem;'>📍 {b['dist_km']} km away</span>"
-
-                col_card, col_action = st.columns([4, 1.2])
-                with col_card:
-                    st.markdown(
-                        f"""
-                        <div class="{card_class}">
-                            <div class="bus-left-meta">
-                                <div class="bus-top-row">
-                                    <span class="route-badge" style="background: {b['neon_bg']}; color: {b['neon']}; border: 1px solid {b['neon']}; box-shadow: 0 0 8px {b['neon_bg']};">
-                                        {b['route']}
-                                    </span>
-                                    <span class="plate-num">{b['vehicle_id']}</span>
-                                    <span class="{pill_class}">{b['status_short']}</span>
-                                    {dist_badge}
-                                </div>
-                                <div class="direction-sub">
-                                    🏁 {b['direction']} · 🧭 {b['heading']} · ⏱️ Fix {b['age_text']}
-                                </div>
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
+                col_row_info, col_row_btn = st.columns([4, 1.2], vertical_alignment="center")
+                with col_row_info:
+                    row_html = (
+                        f'<div class="fleet-row-card {card_active_class}">'
+                        f'<div class="fleet-meta-left">'
+                        f'<span class="route-badge" style="background:{b["neon_bg"]};color:{b["neon"]};border:1px solid {b["neon"]};">{b["route"]}</span>'
+                        f'<span class="plate-num">{b["vehicle_id"]}</span>'
+                        f'<span class="fleet-status-pill {pill_class}">{b["status_short"]}</span>'
+                        f'<span class="dir-sub">➔ {b["direction"]}</span>'
+                        f'{dist_text}'
+                        f'</div>'
+                        f'</div>'
                     )
-                with col_action:
+                    st.markdown(row_html, unsafe_allow_html=True)
+
+                with col_row_btn:
                     btn_label = "🔒 Locked" if is_this_tracked else "🎯 Track"
-                    if st.button(btn_label, key=f"track_{b['vehicle_id']}", use_container_width=True, disabled=is_this_tracked):
+                    if st.button(btn_label, key=f"btn_track_{b['vehicle_id']}", use_container_width=True, disabled=is_this_tracked):
                         st.session_state.target_bus = b["vehicle_id"]
                         rerun_fragment()
         else:
             st.info("No active buses detected on selected route right now.")
-
-        # 9. Offline / Disappeared Buses (Compact Collapsible)
-        if offline:
-            with st.expander(f"🔴 Offline / Disappeared Buses ({len(offline)})", expanded=False):
-                df_off_table = pd.DataFrame([{
-                    "Route": o["route"],
-                    "Vehicle ID": o["vehicle_id"],
-                    "Direction": o["direction"],
-                    "Last Seen (IST)": fmt_ist(o["last_seen"]),
-                    "Offline For": format_duration(o["offline_for"]),
-                } for o in offline])
-                st.dataframe(df_off_table, hide_index=True, use_container_width=True)
 
     # ---------------- Fragment Execution ----------------
     fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)

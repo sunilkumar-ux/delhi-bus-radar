@@ -105,7 +105,9 @@ CARTO_LIGHT = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
 
 # Physics / telemetry thresholds
 MOVING_KMH = 3.0
-JITTER_M = 3.5           # Distance threshold to update continuous trajectory bearing
+JITTER_M = 3.5           # Distance threshold used by the speed / stopped-timer logic
+BEARING_MIN_M = 11.0     # Min displacement before a freshly computed heading is trusted
+BEARING_SNAP_M = 30.0    # Above this displacement the new heading is taken outright
 TRAIL_MIN_M = 15.0       # Minimum distance to append point to trail
 TRAIL_MAX_GAP_M = 350.0  # Reset trail if jump exceeds 350m to avoid chords cutting across city
 MAX_SANE_KMH = 105.0
@@ -123,6 +125,16 @@ OFFLINE_KEEP_S = 4 * 3600
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30), "IST")
 
+# Streamlit renamed `use_container_width=True` to `width="stretch"` and prints
+# "will be removed after 2025-12-31" on every call. Streamlit Community Cloud
+# upgrades itself, so pick whichever spelling the installed runtime supports
+# instead of leaving a time-bomb in a live app.
+try:
+    _ST_VER = tuple(int(p) for p in st.__version__.split(".")[:2])
+except Exception:
+    _ST_VER = (1, 40)
+WIDE = {"width": "stretch"} if _ST_VER >= (1, 49) else {"use_container_width": True}
+
 
 # =============================================================================
 # 2. DIRECTIONAL SVG BUS ICON GENERATOR
@@ -131,8 +143,9 @@ IST = dt.timezone(dt.timedelta(hours=5, minutes=30), "IST")
 def generate_bus_svg_icon(color_hex: str) -> dict:
     """
     Generates a top-down transit bus SVG icon pointing North (0 degrees).
-    Deck.gl applies get_angle="bearing_angle" to continuously rotate
-    the bus to every single degree (0.0 to 360.0).
+    Deck.gl applies get_angle="icon_angle" - the compass bearing converted to
+    deck.gl's counter-clockwise convention by to_icon_angle() - to continuously
+    rotate the bus to every single degree (0.0 to 360.0).
     """
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
   <rect x="14" y="6" width="32" height="48" rx="8" fill="{color_hex}" fill-opacity="0.28"/>
@@ -189,6 +202,54 @@ def calc_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon)
     initial_bearing = math.degrees(math.atan2(y, x))
     return (initial_bearing + 360.0) % 360.0
+
+
+def angle_delta(from_deg: float, to_deg: float) -> float:
+    """Shortest signed rotation from one compass angle to another, in (-180, 180]."""
+    return (to_deg - from_deg + 540.0) % 360.0 - 180.0
+
+
+def blend_bearing(old_deg: float, new_deg: float, weight: float) -> float:
+    """
+    Circular blend that always travels the short way round, so a heading moving
+    through due north (359 -> 2) never swings 357 degrees backwards.
+    """
+    return (old_deg + angle_delta(old_deg, new_deg) * weight) % 360.0
+
+
+def is_quantised_bearing(deg: float | None) -> bool:
+    """
+    True when the feed's own bearing looks like a cheap compass rather than a real
+    heading. Several Delhi GPS vendors emit only 0/90/180/270 (or 45-degree steps),
+    which is exactly what makes icons appear to snap to a handful of directions.
+    Such values are only ever used as a weak seed, never as a live heading.
+    """
+    if deg is None:
+        return True
+    return abs(deg - round(deg / 45.0) * 45.0) < 0.01
+
+
+def to_icon_angle(compass_deg: float) -> float:
+    """
+    Convert a compass bearing (clockwise from north) into deck.gl's IconLayer
+    `getAngle`, which rotates COUNTER-clockwise.
+
+    deck.gl icon-layer-vertex.glsl rotates by mat2(cos, -sin, sin, cos) and then
+    flips Y into clip space, so getAngle=+90 points the icon WEST. Feeding a raw
+    compass bearing therefore mirrors every bus across the north-south axis:
+    east renders as west, north-east renders as north-west, and only due north
+    and due south happen to look correct.
+    """
+    return (360.0 - (compass_deg % 360.0)) % 360.0
+
+
+_COMPASS_16 = ("N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+               "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW")
+
+
+def compass_point(deg: float) -> str:
+    """Human-readable 16-point compass label for a bearing, e.g. 112.4 -> 'ESE'."""
+    return _COMPASS_16[int((deg % 360.0) / 22.5 + 0.5) % 16]
 
 
 def fmt_ist(ts: float | None) -> str:
@@ -399,10 +460,18 @@ class FleetTracker:
         self.offline.pop(vid, None)
         st_ = self.buses.get(vid)
 
-        # Initial heading estimate based on route destination
+        # Initial heading estimate based on route destination.
+        # The feed's own bearing is only trusted as a seed when it is NOT snapped
+        # to a 45-degree step: several Delhi GPS vendors emit nothing but
+        # 0/90/180/270, and seeding from those is a direct cause of buses sitting
+        # on cardinal directions until they next move.
         initial_bearing = 190.0 if "Kapashera" in info["dir"] else 20.0
-        if rec["bearing"] is not None and rec["bearing"] > 0:
-            initial_bearing = rec["bearing"]
+        feed_bearing = rec["bearing"]
+        seed_measured = False
+        if feed_bearing is not None and 0.0 <= feed_bearing < 360.0 \
+                and not is_quantised_bearing(feed_bearing):
+            initial_bearing = feed_bearing
+            seed_measured = True
 
         if st_ is None:
             fix_time = rec["ts"] if has_ts else wall
@@ -420,6 +489,12 @@ class FleetTracker:
                 "lat": rec["lat"],
                 "lon": rec["lon"],
                 "bearing": round(initial_bearing, 1),
+                # Unwrapped twin of `bearing` expressed in deck.gl's counter-clockwise
+                # convention. It is allowed to run past 360 / below 0 so that WebGL's
+                # linear getAngle interpolation always takes the short way round
+                # instead of spinning 350 degrees backwards when crossing north.
+                "icon_angle": to_icon_angle(initial_bearing),
+                "bearing_measured": seed_measured,
                 "fix_time": fix_time,
                 "has_ts": has_ts,
                 "last_seen": wall,
@@ -456,12 +531,34 @@ class FleetTracker:
             is_new = moved_m > 0.5
             fix_time = wall if is_new else st_["fix_time"]
 
-        # Calculate exact continuous 0.0-360.0 degree heading along road
-        if moved_m >= JITTER_M:
+        # Tolerate tracker entries created before these fields existed.
+        st_.setdefault("icon_angle", to_icon_angle(st_["bearing"]))
+        st_.setdefault("bearing_measured", False)
+
+        # ---- Exact continuous 0.0-360.0 degree heading along the road --------
+        # The heading is the true forward azimuth from the previous GPS fix to the
+        # latest GPS fix, to one decimal place. Below BEARING_MIN_M the apparent
+        # movement is mostly GPS noise, so the last good heading is held rather
+        # than letting jitter spin the bus to a random direction.
+        if moved_m >= BEARING_MIN_M:
             exact_heading = calc_bearing(st_["lat"], st_["lon"], rec["lat"], rec["lon"])
-            st_["bearing"] = round(exact_heading, 1)
-        elif rec["bearing"] is not None and rec["bearing"] > 0 and st_["bearing"] == 0.0:
-            st_["bearing"] = round(rec["bearing"], 1)
+            if moved_m >= BEARING_SNAP_M:
+                new_bearing = exact_heading          # long confident leg: take it as-is
+            else:
+                # Short leg: ease into it so curves read smoothly. blend_bearing
+                # goes the short way round, so 359 -> 2 never swings backwards.
+                new_bearing = blend_bearing(st_["bearing"], exact_heading, 0.72)
+            st_["bearing"] = round(new_bearing, 1)
+            st_["bearing_measured"] = True
+            st_["icon_angle"] += angle_delta(st_["icon_angle"] % 360.0,
+                                             to_icon_angle(st_["bearing"]))
+        elif (not st_["bearing_measured"] and feed_bearing is not None
+                and 0.0 <= feed_bearing < 360.0 and not is_quantised_bearing(feed_bearing)):
+            # No real trajectory measured yet - a genuine fractional feed bearing
+            # still beats the route-direction guess.
+            st_["bearing"] = round(feed_bearing, 1)
+            st_["icon_angle"] += angle_delta(st_["icon_angle"] % 360.0,
+                                             to_icon_angle(st_["bearing"]))
 
         if rec["speed_ms"] is not None:
             st_["speed_feed"] = rec["speed_ms"] * 3.6
@@ -567,7 +664,12 @@ class FleetTracker:
                     "status_short": status_short,
                     "status_text": status_text,
                     "bearing": b["bearing"],
-                    "bearing_angle": float(b.get("bearing", 0.0) or 0.0),
+                    # True compass heading, clockwise from north, one decimal.
+                    "bearing_angle": round(float(b["bearing"]) % 360.0, 1),
+                    "heading_text": compass_point(b["bearing"]),
+                    # deck.gl IconLayer angle: counter-clockwise, and deliberately
+                    # left unwrapped so getAngle interpolation takes the short path.
+                    "icon_angle": round(float(b.get("icon_angle", to_icon_angle(b["bearing"]))), 1),
                     "icon_spec": icon_spec,
                     "age_s": age,
                     "age_text": f"{format_duration(age)} ago",
@@ -776,6 +878,60 @@ div[data-testid="stButton"] > button {
 .deck-tooltip {
     pointer-events: none !important;
     z-index: 999999 !important;
+    max-width: 280px !important;
+    white-space: normal !important;
+}
+
+/* Tap-to-inspect detail card (the touch-friendly replacement for hover) */
+.tap-card {
+    background: linear-gradient(135deg, rgba(15, 23, 42, 0.97), rgba(24, 33, 53, 0.93));
+    border: 1px solid rgba(0, 229, 255, 0.35);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin: 10px 0 6px 0;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.5);
+}
+.tap-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+.tap-tag {
+    margin-left: auto;
+    font-size: 0.62rem;
+    font-weight: 800;
+    letter-spacing: 1.2px;
+    color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-radius: 4px;
+    padding: 1px 6px;
+}
+.tap-dir {
+    font-size: 0.95rem;
+    font-weight: 800;
+    margin-bottom: 8px;
+}
+.tap-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.tap-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 3px 0;
+    border-bottom: 1px dashed rgba(148, 163, 184, 0.14);
+}
+.tap-row:last-child { border-bottom: none; }
+.tap-k { color: #94a3b8; font-size: 0.78rem; }
+.tap-v {
+    color: #e2e8f0;
+    font-size: 0.80rem;
+    font-weight: 700;
+    text-align: right;
 }
 </style>
 """
@@ -803,6 +959,31 @@ def rerun_fragment() -> None:
         st.rerun()
 
 
+# Session-state key shared by the camera-lock picker and every button that
+# changes the tracked bus. Widget and app state are deliberately the SAME key so
+# the two can never disagree.
+TARGET_KEY = "target_bus"
+TAPPED_KEY = "tapped_bus"
+
+
+def set_target(vid: str) -> None:
+    """
+    on_click callback for the Track / Free Roam buttons.
+
+    Streamlit runs callbacks BEFORE the script reruns, so writing the widget's own
+    key here means the selectbox is rebuilt already holding the new value. Doing
+    the same assignment inline after the widget has rendered does not work - the
+    widget has already returned its previous value for this run.
+    """
+    st.session_state[TARGET_KEY] = vid
+    if vid != "None":
+        st.session_state[TAPPED_KEY] = vid
+
+
+def clear_tapped() -> None:
+    st.session_state[TAPPED_KEY] = None
+
+
 # =============================================================================
 # 7. MAIN APPLICATION
 # =============================================================================
@@ -813,8 +994,10 @@ def main() -> None:
 
     if "view_state" not in st.session_state:
         st.session_state.view_state = pdk.ViewState(pitch=0, bearing=0, **DEFAULT_VIEW)
-    if "target_bus" not in st.session_state:
-        st.session_state.target_bus = "None"
+    if TARGET_KEY not in st.session_state:
+        st.session_state[TARGET_KEY] = "None"
+    if TAPPED_KEY not in st.session_state:
+        st.session_state[TAPPED_KEY] = None
     if "view_initialized" not in st.session_state:
         st.session_state.view_initialized = False
 
@@ -833,7 +1016,7 @@ def main() -> None:
     sb.markdown("### ⏱️ Refresh Rate")
     auto_refresh = sb.toggle("Live Auto-Refresh", value=True)
     refresh_rate = int(sb.number_input("Interval (seconds):", min_value=2, max_value=60, value=4))
-    if sb.button("🔄 Refresh Now", use_container_width=True):
+    if sb.button("🔄 Refresh Now", **WIDE):
         st.rerun()
 
     sb.divider()
@@ -907,30 +1090,41 @@ def main() -> None:
         st.markdown(stats_html, unsafe_allow_html=True)
 
         # 4. Bus Tracking Selection Menu (Re-added, Clean, No Keyboard, Persisted State)
-        target_id = st.session_state.target_bus
-        target_info = next((v for v in views if v["vehicle_id"] == target_id), None) if target_id != "None" else None
+        target_id = st.session_state.get(TARGET_KEY, "None")
 
         bus_choices = ["None"] + [v["vehicle_id"] for v in views]
+        # Keep a locked bus selectable even if it drops off this refresh (lost GPS
+        # fix, or hidden by the route filter) so the widget can never raise and the
+        # lock is not silently thrown away by one missed poll.
+        if target_id != "None" and target_id not in bus_choices:
+            bus_choices.insert(1, target_id)
+
         def format_choice(vid: str) -> str:
             if vid == "None":
                 return "🌐 Free Roam (Show All Buses · Camera Unlocked)"
             v = next((b for b in views if b["vehicle_id"] == vid), None)
             if not v:
-                return vid
+                return f"⚠ {vid} · not in current view"
             return f"{v['badge']} {v['route']} • {v['vehicle_id']} ➔ {v['direction']} ({v['speed_kmh']} km/h)"
 
-        cur_idx = bus_choices.index(target_id) if target_id in bus_choices else 0
-        chosen_bus = st.selectbox(
+        # SINGLE SOURCE OF TRUTH.
+        # The selectbox is keyed directly on `target_bus`, so the widget and the
+        # app state are the same object. Previously the picker owned a separate
+        # key and, because a keyed widget's stored value overrides `index=`, the
+        # stale picker value was written straight back over anything a button had
+        # just set - which silently reverted BOTH "Free Roam" and "Track".
+        # Buttons now mutate `target_bus` from on_click callbacks, which Streamlit
+        # runs *before* the rerun, so the selectbox is rebuilt already in sync.
+        st.selectbox(
             "🎯 Target Bus & Strict Camera Lock:",
             bus_choices,
-            index=cur_idx,
             format_func=format_choice,
-            key="bus_track_picker",
+            key=TARGET_KEY,
             help="Select any bus to strictly lock the camera. Panning is locked on target, but zoom in/out is enabled.",
         )
-        if chosen_bus != target_id:
-            st.session_state.target_bus = chosen_bus
-            rerun_fragment()
+        target_id = st.session_state[TARGET_KEY]
+        target_info = next((v for v in views if v["vehicle_id"] == target_id), None) \
+            if target_id != "None" else None
 
         # 5. Telemetry HUD for Selected Bus
         if target_info:
@@ -953,9 +1147,33 @@ def main() -> None:
                 )
                 st.markdown(hud_html, unsafe_allow_html=True)
             with hud_col_btn:
-                if st.button("✕ Free Roam", key="release_hud_btn", use_container_width=True):
-                    st.session_state.target_bus = "None"
-                    rerun_fragment()
+                st.button(
+                    "✕ Free Roam",
+                    key="release_hud_btn",
+                    **WIDE,
+                    on_click=set_target,
+                    args=("None",),
+                )
+        elif target_id != "None":
+            # Camera is locked onto a bus that is not in the current view - it has
+            # stopped reporting GPS, or the route filter now hides it. The HUD (and
+            # with it the release button) would otherwise vanish and strand the
+            # user, so keep an explicit release control on screen. The picker's own
+            # label can go stale in this state, so say plainly what is happening.
+            lost_info, lost_btn = st.columns([4, 1.2], vertical_alignment="center")
+            with lost_info:
+                st.warning(
+                    f"📡 Bus **{target_id}** is not reporting right now — "
+                    f"camera lock is on hold until it reappears."
+                )
+            with lost_btn:
+                st.button(
+                    "✕ Free Roam",
+                    key="release_lost_btn",
+                    **WIDE,
+                    on_click=set_target,
+                    args=("None",),
+                )
 
         # 6. Map Viewport & Strict Camera Lock Controller
         # - When tracking: Strict Lock (camera follows bus, dragPan disabled, scroll/touch zoom enabled)
@@ -993,10 +1211,16 @@ def main() -> None:
         # 7. PyDeck Radar Map Layers (Continuous Rotations, Accurate Trails, Mobile Touch Hit-Targets)
         layers = []
 
-        # Smooth WebGL Transitions (Slides position & heading smoothly across updates)
+        # Smooth WebGL transitions (slides position & heading across updates).
+        # ScatterplotLayer has no getAngle attribute, so handing it a getAngle
+        # transition makes deck.gl's attribute manager complain; position-only
+        # transitions are used for those layers.
         layer_transitions = {
             "getPosition": {"duration": 2200, "type": "interpolation"},
-            "getAngle": {"duration": 600, "type": "interpolation"},
+        }
+        icon_transitions = {
+            "getPosition": {"duration": 2200, "type": "interpolation"},
+            "getAngle": {"duration": 900, "type": "interpolation"},
         }
 
         # Accurate Movement Trail (Follows actual street trajectory, resets on jumps)
@@ -1028,6 +1252,12 @@ def main() -> None:
                 radius_min_pixels=28,
                 radius_max_pixels=40,
                 pickable=True,
+                # Streamlit turns on auto-highlight for pickable layers when
+                # selections are enabled; deck.gl's default highlight is an opaque
+                # navy disc that would sit on top of the bus. Replace it with a
+                # soft cyan halo so a tap reads as a deliberate selection glow.
+                auto_highlight=True,
+                highlight_color=[0, 229, 255, 60],
                 transitions=layer_transitions,
             ))
 
@@ -1039,10 +1269,16 @@ def main() -> None:
                 get_icon="icon_spec",
                 get_position="[lon, lat]",
                 get_size=36,
-                get_angle="bearing_angle",
+                # deck.gl rotates icons COUNTER-clockwise, so the clockwise compass
+                # bearing is pre-converted in icon_angle. Feeding the raw bearing
+                # here mirrors every bus across the north-south axis.
+                get_angle="icon_angle",
                 size_scale=1,
+                billboard=True,
                 pickable=True,
-                transitions=layer_transitions,
+                auto_highlight=True,
+                highlight_color=[255, 255, 255, 70],
+                transitions=icon_transitions,
             ))
 
             # Layer C: Floating Route Badge Above Each Bus
@@ -1099,16 +1335,19 @@ def main() -> None:
                 filled=True,
             ))
 
-        # Click & Hold Accurate Tooltip
+        # Hover tooltip (desktop pointers only - deck.gl tooltips are driven by
+        # onHover, which touchscreens never fire. The tap-to-inspect panel below
+        # the map is what makes this work on a phone.)
         map_tooltip = {
             "html": (
-                '<div style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; font-size: 13px; line-height: 1.4; color: #fff; padding: 2px;">'
+                '<div style="font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; font-size: 13px; line-height: 1.45; color: #fff; padding: 2px;">'
                 '<div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">'
                 '<span style="background: {neon_bg}; color: {neon}; border: 1px solid {neon}; padding: 1px 6px; border-radius: 4px; font-weight: 800; font-size: 12px;">{route}</span>'
                 '<span style="font-family: monospace; font-weight: 700; font-size: 13px; color: #fff;">{vehicle_id}</span>'
                 '</div>'
                 '<div style="color: #cbd5e1; font-size: 12px; margin-bottom: 3px;">🏁 <b>{direction}</b></div>'
                 '<div style="font-weight: 700; color: #00E5FF; font-size: 12px;">⚡ {speed_kmh} km/h · {status_short}</div>'
+                '<div style="color: #94a3b8; font-size: 11px; margin-top: 2px;">🧭 Heading {bearing_angle}° {heading_text} · fix {last_fix_ist}</div>'
                 '</div>'
             ),
             "style": {
@@ -1123,8 +1362,13 @@ def main() -> None:
             },
         }
 
-        # Render PyDeck Map with CARTO Dark Tiles & Strict/Free Viewport Controller
-        st.pydeck_chart(
+        # Render PyDeck Map with CARTO Dark Tiles & Strict/Free Viewport Controller.
+        # on_select="rerun" turns the map into a real input widget, so a finger TAP
+        # (which never produces a hover event, and therefore never produced a
+        # deck.gl tooltip) is reported back to Python and drives the detail panel
+        # underneath. Every layer carries an explicit id, which Streamlit requires
+        # for selections to stay stable across reruns.
+        map_event = st.pydeck_chart(
             pdk.Deck(
                 layers=layers,
                 initial_view_state=view_state,
@@ -1132,8 +1376,82 @@ def main() -> None:
                 map_style=map_style_url,
                 tooltip=map_tooltip,
             ),
-            use_container_width=True,
+            **WIDE,
+            key="radar_map",
+            on_select="rerun",
+            selection_mode="single-object",
         )
+
+        # ---- Tap-to-inspect: resolve whichever bus the user touched -----------
+        picked_vid = None
+        try:
+            sel = getattr(map_event, "selection", None)
+            objs = {}
+            if isinstance(sel, dict):
+                objs = sel.get("objects") or {}
+            elif sel is not None:
+                objs = getattr(sel, "objects", None) or {}
+            for layer_id in ("bus-icons", "touch-hitbox"):
+                rows = objs.get(layer_id) or []
+                if rows:
+                    picked_vid = str(rows[0].get("vehicle_id") or "").strip() or None
+                    break
+        except Exception:
+            picked_vid = None
+
+        # React to CHANGES in the map selection, not to its standing value.
+        # The chart keeps its selection across the auto-refresh reruns, so acting
+        # on the standing value would make the "Close" button useless - the card
+        # would immediately reopen on the next refresh. Comparing against the
+        # previous run also means tapping empty map space clears the card.
+        if picked_vid != st.session_state.get("_map_sel_prev", "\x00"):
+            st.session_state["_map_sel_prev"] = picked_vid
+            st.session_state[TAPPED_KEY] = picked_vid
+
+        tapped_id = st.session_state.get(TAPPED_KEY)
+        tapped = next((v for v in views if v["vehicle_id"] == tapped_id), None) if tapped_id else None
+
+        if tapped:
+            dist_line = (
+                f'<div class="tap-row"><span class="tap-k">Distance to my stop</span>'
+                f'<span class="tap-v">{tapped["dist_km"]} km</span></div>'
+                if (use_my_stop and "dist_km" in tapped) else ""
+            )
+            st.markdown(
+                f'<div class="tap-card" style="border-color:{tapped["neon"]}55;">'
+                f'<div class="tap-head">'
+                f'<span class="route-badge" style="background:{tapped["neon_bg"]};color:{tapped["neon"]};border:1px solid {tapped["neon"]};">{tapped["route"]}</span>'
+                f'<span class="plate-num">{tapped["vehicle_id"]}</span>'
+                f'<span class="tap-tag">SELECTED</span>'
+                f'</div>'
+                f'<div class="tap-dir" style="color:{tapped["neon"]};">➔ {tapped["direction"]}</div>'
+                f'<div class="tap-grid">'
+                f'<div class="tap-row"><span class="tap-k">Route number</span><span class="tap-v">{tapped["route_short"]}</span></div>'
+                f'<div class="tap-row"><span class="tap-k">Bus number</span><span class="tap-v">{tapped["vehicle_id"]}</span></div>'
+                f'<div class="tap-row"><span class="tap-k">Status</span><span class="tap-v">{tapped["status_text"]}</span></div>'
+                f'<div class="tap-row"><span class="tap-k">Speed</span><span class="tap-v">{tapped["speed_kmh"]} km/h</span></div>'
+                f'<div class="tap-row"><span class="tap-k">Heading</span><span class="tap-v">{tapped["bearing_angle"]}° {tapped["heading_text"]}</span></div>'
+                f'<div class="tap-row"><span class="tap-k">Last GPS fix</span><span class="tap-v">{tapped["last_fix_ist"]} IST · {tapped["age_text"]}</span></div>'
+                f'{dist_line}'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+            tap_a, tap_b = st.columns(2)
+            with tap_a:
+                st.button(
+                    "🔒 Lock camera on this bus",
+                    key="tap_lock_btn",
+                    **WIDE,
+                    disabled=(target_id == tapped["vehicle_id"]),
+                    on_click=set_target,
+                    args=(tapped["vehicle_id"],),
+                )
+            with tap_b:
+                st.button("✕ Close", key="tap_close_btn",
+                          on_click=clear_tapped, **WIDE)
+        elif tapped_id:
+            # Bus was tapped but has since dropped out of the filtered view.
+            st.caption(f"ℹ️ Bus {tapped_id} is no longer in the current view.")
 
         # 8. High-Density Active Fleet List (Compact, 1-tap track)
         st.markdown(f"### 🚍 Active Fleet ({len(views)} Live Buses)")
@@ -1162,9 +1480,14 @@ def main() -> None:
 
                 with col_row_btn:
                     btn_label = "🔒 Locked" if is_this_tracked else "🎯 Track"
-                    if st.button(btn_label, key=f"btn_track_{b['vehicle_id']}", use_container_width=True, disabled=is_this_tracked):
-                        st.session_state.target_bus = b["vehicle_id"]
-                        rerun_fragment()
+                    st.button(
+                        btn_label,
+                        key=f"btn_track_{b['vehicle_id']}",
+                        **WIDE,
+                        disabled=is_this_tracked,
+                        on_click=set_target,
+                        args=(b["vehicle_id"],),
+                    )
         else:
             st.info("No active buses detected on selected route right now.")
 

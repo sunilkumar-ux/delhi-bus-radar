@@ -376,10 +376,23 @@ def fetch_feed(api_key: str) -> dict:
         if not (28.0 < lat < 29.5 and 76.5 < lon < 78.0):
             continue
 
+        # STABLE IDENTITY IS MANDATORY.
+        # The old fallback was f"route{raw_route}-{len(found)}", i.e. the bus's
+        # position in *this* parse. Iteration order is not guaranteed between
+        # polls, so such a bus was handed a different identity every 4 seconds:
+        # its trail reset, its heading reset, and anything tracking it lost it
+        # instantly. A bus with no stable id is better dropped than faked - and
+        # in practice the live OTD feed always supplies vehicle.id, so this
+        # fallback chain simply never has to invent anything.
         vid = ""
         if _has(veh, "vehicle"):
             vid = (veh.vehicle.id or veh.vehicle.label or "").strip()
-        vid = vid or (entity.id or "").strip() or f"route{raw_route}-{len(found)}"
+        if not vid:
+            vid = (entity.id or "").strip()
+        if not vid and _has(veh, "trip"):
+            vid = (veh.trip.trip_id or "").strip()
+        if not vid:
+            continue
 
         rec = {
             "vehicle_id": vid,
@@ -663,10 +676,19 @@ class FleetTracker:
                     "state": state,
                     "status_short": status_short,
                     "status_text": status_text,
+                    # Bare stop duration, for places too narrow for the full
+                    # "Stopped (13m 04s)" wording.
+                    "stopped_for": stop_dur if state == "stopped" else "",
                     "bearing": b["bearing"],
                     # True compass heading, clockwise from north, one decimal.
                     "bearing_angle": round(float(b["bearing"]) % 360.0, 1),
                     "heading_text": compass_point(b["bearing"]),
+                    # False => the heading is still the route-direction seed and
+                    # has never been confirmed by actual movement. The live Delhi
+                    # OTD feed ships NO position.bearing at all, so every bus
+                    # starts out unmeasured and only earns a real heading once it
+                    # has covered BEARING_MIN_M between two fixes.
+                    "bearing_measured": bool(b.get("bearing_measured", False)),
                     # deck.gl IconLayer angle: counter-clockwise, and deliberately
                     # left unwrapped so getAngle interpolation takes the short path.
                     "icon_angle": round(float(b.get("icon_angle", to_icon_angle(b["bearing"]))), 1),
@@ -714,12 +736,33 @@ header[data-testid="stHeader"] {
     background-color: transparent !important;
 }
 
-/* Prevent Android keyboard from opening on selectbox click */
+/* ---- Selectbox: no caret, no text selection, FULL tap target -------------
+   The original rule put pointer-events:none on the combobox input to stop the
+   Android keyboard. Measured in a real browser, that did two things, and only
+   one of them was intended:
+     - it did NOT stop the keyboard (the listbox still moves focus to the input
+       programmatically when it opens), and
+     - it killed the tap target: only the ~16px chevron at the far right still
+       opened the list, so tapping the middle of the control did nothing at all.
+   Keeping the caret/selection suppression and stretching the chevron button
+   across the whole control restores a full-width, thumb-sized hit area.      */
 div[data-testid="stSelectbox"] input {
     pointer-events: none !important;
     caret-color: transparent !important;
     user-select: none !important;
     -webkit-user-select: none !important;
+}
+div[data-testid="stSelectbox"] div[role="group"] { position: relative; }
+div[data-testid="stSelectbox"] div[role="group"] > button {
+    position: absolute !important;
+    top: 0; left: 0; right: 0; bottom: 0;
+    width: 100% !important;
+    height: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-end !important;
+    background: transparent !important;
+    border: none !important;
 }
 
 /* App Header */
@@ -852,8 +895,100 @@ div[data-testid="stSelectbox"] input {
     display: flex;
     align-items: center;
     gap: 7px;
-    flex-wrap: wrap;
+    /* nowrap: a long destination must truncate, not spill onto a second line
+       and double the height of every single row. */
+    flex-wrap: nowrap;
     overflow: hidden;
+    min-width: 0;
+}
+.fleet-meta-left > * { flex: 0 0 auto; }
+.fleet-meta-left .dir-sub {
+    flex: 0 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ---- Compact fleet list --------------------------------------------------
+   Streamlit stacks st.columns vertically on narrow screens, which is exactly
+   what made each bus occupy two tall rows on a phone. Forcing nowrap on these
+   specific horizontal blocks keeps the Track button inline. Colours are
+   deliberately untouched.                                                   */
+.st-key-fleetlist div[data-testid="stHorizontalBlock"],
+.st-key-hudrow div[data-testid="stHorizontalBlock"] {
+    flex-wrap: nowrap !important;
+    gap: 6px !important;
+    align-items: center !important;
+}
+.st-key-fleetlist div[data-testid="stColumn"],
+.st-key-hudrow div[data-testid="stColumn"] {
+    min-width: 0 !important;
+    flex-shrink: 1 !important;
+}
+.st-key-fleetlist div[data-testid="stColumn"]:last-child,
+.st-key-hudrow div[data-testid="stColumn"]:last-child {
+    flex: 0 0 auto !important;
+    width: auto !important;
+}
+.st-key-fleetlist [data-testid="stVerticalBlock"] { gap: 0 !important; }
+.st-key-fleetlist .fleet-row-card { margin-bottom: 4px; padding: 4px 8px; }
+.st-key-fleetlist div[data-testid="stButton"] > button {
+    padding: 2px 8px !important;
+    min-height: 28px !important;
+    height: 28px !important;
+    font-size: 0.85rem !important;
+}
+/* Pan-lock chip + stop button in the tracking HUD row */
+.st-key-pan_lock_btn button {
+    background: rgba(0, 229, 255, 0.10) !important;
+    border: 1px solid rgba(0, 229, 255, 0.45) !important;
+    color: #7fe9ff !important;
+    font-size: 0.78rem !important;
+    font-weight: 700 !important;
+    white-space: nowrap !important;
+    padding: 2px 10px !important;
+    min-height: 30px !important;
+    width: 100% !important;
+}
+.st-key-pan_lock_btn button:hover,
+.st-key-pan_lock_btn button:focus,
+.st-key-pan_lock_btn button:active {
+    background: rgba(0, 229, 255, 0.20) !important;
+    border-color: #00E5FF !important;
+    color: #ffffff !important;
+}
+.st-key-stop_track_btn button {
+    background: rgba(148, 163, 184, 0.12) !important;
+    border: 1px solid rgba(148, 163, 184, 0.3) !important;
+    color: #cbd5e1 !important;
+    min-height: 30px !important;
+    padding: 2px 10px !important;
+}
+.hud-lost {
+    color: #FFAB00;
+    font-weight: 700;
+}
+
+/* ---- Narrow phones: claw back vertical space --------------------------
+   Same colours, just a tighter header so the map starts higher up.       */
+@media (max-width: 480px) {
+    .app-header-strip { flex-wrap: nowrap; gap: 8px; }
+    .app-brand-title { font-size: 1.02rem; white-space: nowrap; }
+    .app-feed-meta { font-size: 0.64rem; text-align: right; }
+    .block-container { padding-top: 2.2rem !important; }
+    .hud-strip { padding: 6px 10px; }
+    .hud-metrics-row { font-size: 0.78rem; gap: 9px; }
+    .hud-top-line { gap: 6px; margin-bottom: 4px; }
+    .hud-top-line .dir-sub { font-size: 0.72rem; }
+    .st-key-pan_lock_btn button { font-size: 0.72rem !important; padding: 2px 6px !important; }
+    .tap-head { padding-right: 118px; }
+    /* "Active Fleet (16 Live Buses)" wrapped onto two tall lines */
+    h3 { font-size: 1.02rem !important; white-space: nowrap; margin-bottom: 4px !important; }
+    .st-key-fleetlist .plate-num { font-size: 0.86rem; }
+    .st-key-fleetlist .route-badge { font-size: 0.74rem; padding: 2px 6px; }
+    .st-key-fleetlist .fleet-status-pill { font-size: 0.66rem; }
+    .st-key-fleetlist .dir-sub { font-size: 0.72rem; }
 }
 .fleet-status-pill {
     padding: 2px 6px;
@@ -897,16 +1032,77 @@ div[data-testid="stButton"] > button {
     gap: 8px;
     flex-wrap: wrap;
     margin-bottom: 6px;
+    /* Reserve the top-right corner for the floating Track / close controls. */
+    padding-right: 124px;
+    min-height: 26px;
 }
-.tap-tag {
-    margin-left: auto;
-    font-size: 0.62rem;
-    font-weight: 800;
-    letter-spacing: 1.2px;
+.tap-est {
+    font-size: 0.68rem;
+    font-weight: 700;
     color: #94a3b8;
     border: 1px solid rgba(148, 163, 184, 0.35);
     border-radius: 4px;
-    padding: 1px 6px;
+    padding: 0 4px;
+    margin-left: 4px;
+}
+.tap-trend {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #94a3b8;
+    margin-left: 4px;
+}
+
+/* ---- Floating controls inside the tap-detail card -----------------------
+   Streamlit >=1.39 stamps a `st-key-<key>` class onto every keyed element, so
+   the card container and its two buttons can be targeted precisely without
+   relying on DOM order. Both buttons are taken out of flow, which is why they
+   add no height to the card at all.                                        */
+.st-key-tapcard { position: relative; }
+.st-key-tapcard .st-key-tap_track_btn {
+    position: absolute;
+    top: 20px;
+    right: 56px;
+    width: auto !important;
+    z-index: 6;
+}
+.st-key-tapcard .st-key-tap_close_btn {
+    position: absolute;
+    top: 20px;
+    right: 16px;
+    width: auto !important;
+    z-index: 6;
+}
+.st-key-tap_track_btn button {
+    background: #FFF27A !important;
+    border: 1px solid #FFE14D !important;
+    color: #0c1222 !important;
+    font-weight: 800 !important;
+    font-size: 0.72rem !important;
+    letter-spacing: 0.2px;
+    padding: 2px 9px !important;
+    min-height: 26px !important;
+    height: 26px !important;
+    border-radius: 6px !important;
+    box-shadow: 0 0 10px rgba(255, 242, 122, 0.35) !important;
+    white-space: nowrap;
+}
+.st-key-tap_track_btn button:hover,
+.st-key-tap_track_btn button:focus,
+.st-key-tap_track_btn button:active {
+    background: #FFE14D !important;
+    border-color: #FFF27A !important;
+    color: #0c1222 !important;
+    box-shadow: 0 0 14px rgba(255, 242, 122, 0.55) !important;
+}
+.st-key-tap_close_btn button {
+    background: rgba(148, 163, 184, 0.12) !important;
+    border: 1px solid rgba(148, 163, 184, 0.3) !important;
+    color: #cbd5e1 !important;
+    font-size: 0.72rem !important;
+    padding: 2px 8px !important;
+    min-height: 26px !important;
+    height: 26px !important;
+    border-radius: 6px !important;
 }
 .tap-dir {
     font-size: 0.95rem;
@@ -959,25 +1155,72 @@ def rerun_fragment() -> None:
         st.rerun()
 
 
-# Session-state key shared by the camera-lock picker and every button that
-# changes the tracked bus. Widget and app state are deliberately the SAME key so
-# the two can never disagree.
+# ---------------------------------------------------------------------------
+# Tracking state.
+#
+# TARGET_KEY is now PLAIN session state - it is deliberately NOT the key of any
+# widget any more. That one change kills an entire class of bug.
+#
+# WHY: Streamlit serialises a selectbox's value as its *formatted label string*
+# (SelectboxSerde.serialize -> format_func(value)) and deserialises it with
+#     option_index = formatted_option_to_option_index.get(ui_value)
+#     return self.options[option_index] if option_index is not None else ui_value
+# The final `else ui_value` is the trap. The old picker's label embedded the bus's
+# live speed - "D-068 - DL1PD7776 -> Towards Dwarka Mor (36.8 km/h)" - which
+# changes on literally every 4-second poll. So the label the browser echoed back
+# no longer existed in the rebuilt options map, the lookup missed, and Streamlit
+# wrote the stale LABEL into st.session_state["target_bus"]. From that moment
+# `next(v for v in views if v["vehicle_id"] == target_id)` could never match,
+# the HUD vanished and the app printed the label verbatim inside
+# "Bus <label> is not reporting right now" - permanently, because every later
+# poll re-fed the corrupted value through the same path.
+# No widget owns this key now, so no serde ever touches it.
 TARGET_KEY = "target_bus"
 TAPPED_KEY = "tapped_bus"
+PANLOCK_KEY = "pan_lock"
+# Last good view-dict of the tracked bus, so a dropped GPS fix does not yank the
+# camera and the HUD away mid-journey.
+TRACK_SNAP_KEY = "_target_snapshot"
+TRACK_LOST_AT_KEY = "_target_lost_at"
+PANLOCK_PREV_KEY = "_pan_lock_prev"
+# Delhi's feed is genuinely patchy - gaps of 1-3 minutes are normal in traffic.
+# Hold the lock through that instead of dumping the user back to free roam.
+TRACK_AUTO_RELEASE_S = 300.0
 
 
-def set_target(vid: str) -> None:
-    """
-    on_click callback for the Track / Free Roam buttons.
-
-    Streamlit runs callbacks BEFORE the script reruns, so writing the widget's own
-    key here means the selectbox is rebuilt already holding the new value. Doing
-    the same assignment inline after the widget has rendered does not work - the
-    widget has already returned its previous value for this run.
-    """
+def start_track(vid: str) -> None:
+    """Begin (or switch) tracking. Never touches TAPPED_KEY."""
+    if not vid or vid == "None":
+        return
     st.session_state[TARGET_KEY] = vid
-    if vid != "None":
-        st.session_state[TAPPED_KEY] = vid
+    st.session_state[TRACK_SNAP_KEY] = None
+    st.session_state[TRACK_LOST_AT_KEY] = None
+
+
+def stop_track() -> None:
+    """Release the camera lock. Never touches TAPPED_KEY."""
+    st.session_state[TARGET_KEY] = "None"
+    st.session_state[TRACK_SNAP_KEY] = None
+    st.session_state[TRACK_LOST_AT_KEY] = None
+
+
+def toggle_track(vid: str) -> None:
+    """
+    on_click callback for every Track control.
+
+    Deliberately leaves TAPPED_KEY alone: the tap-detail card must stay exactly
+    as it is when its Track button is pressed. Streamlit runs callbacks BEFORE
+    the rerun, so the rest of the script sees the new value immediately.
+    """
+    if st.session_state.get(TARGET_KEY, "None") == vid:
+        stop_track()
+    else:
+        start_track(vid)
+
+
+def toggle_pan_lock() -> None:
+    """Flip the camera between 'glued to the bus' and 'free to pan'."""
+    st.session_state[PANLOCK_KEY] = not bool(st.session_state.get(PANLOCK_KEY, True))
 
 
 def clear_tapped() -> None:
@@ -998,6 +1241,14 @@ def main() -> None:
         st.session_state[TARGET_KEY] = "None"
     if TAPPED_KEY not in st.session_state:
         st.session_state[TAPPED_KEY] = None
+    if PANLOCK_KEY not in st.session_state:
+        st.session_state[PANLOCK_KEY] = True
+    if TRACK_SNAP_KEY not in st.session_state:
+        st.session_state[TRACK_SNAP_KEY] = None
+    if TRACK_LOST_AT_KEY not in st.session_state:
+        st.session_state[TRACK_LOST_AT_KEY] = None
+    if PANLOCK_PREV_KEY not in st.session_state:
+        st.session_state[PANLOCK_PREV_KEY] = True
     if "view_initialized" not in st.session_state:
         st.session_state.view_initialized = False
 
@@ -1021,7 +1272,17 @@ def main() -> None:
 
     sb.divider()
     sb.markdown("### 📍 My Stop (Optional)")
-    use_my_stop = sb.toggle("Calculate Distance to My Stop", value=False)
+    use_my_stop = sb.toggle(
+        "Calculate Distance to My Stop",
+        value=False,
+        help="Great-circle (crow-flies) distance between the bus and your stop. "
+             "It is NOT the road distance the bus still has to drive, and it is "
+             "not an ETA. Road distance would need a routing engine or the full "
+             "Delhi GTFS shapes file (~124 MB), neither of which fits here.",
+    )
+    if use_my_stop:
+        sb.caption("📏 Straight-line distance, not road distance. "
+                   "Real road distance is typically 1.3–1.6× this.")
     my_lat = sb.number_input("Latitude", value=28.6190, format="%.5f", disabled=not use_my_stop)
     my_lon = sb.number_input("Longitude", value=77.0321, format="%.5f", disabled=not use_my_stop)
 
@@ -1058,10 +1319,30 @@ def main() -> None:
         views = [v for v in all_views if selected_route in ("All Routes", v["route"])]
         views.sort(key=lambda v: (v["route"], v["direction"], v["vehicle_id"]))
 
-        # Distance calculation
+        # Distance calculation.
+        #
+        # haversine_m is a GREAT-CIRCLE (straight-line) distance - the direct
+        # crow-flies gap between the bus and your stop. It is NOT the distance the
+        # bus still has to drive: that would need either a routing engine (OSRM /
+        # Google Directions) or the GTFS shapes.txt geometry for these routes, and
+        # the full Delhi static GTFS is ~124 MB unzipped, which will not fit in a
+        # free Streamlit Cloud container. Road distance in Dwarka typically runs
+        # 1.3-1.6x the straight line. The UI now says "straight-line" so the number
+        # is never mistaken for an ETA, and pairs it with a cheap but genuinely
+        # useful signal: is the bus pointing toward your stop or away from it?
         if use_my_stop:
-            for v in views:
+            for v in all_views:
                 v["dist_km"] = round(haversine_m(v["lat"], v["lon"], my_lat, my_lon) / 1000, 2)
+                brg_to_stop = calc_bearing(v["lat"], v["lon"], my_lat, my_lon)
+                off = abs(angle_delta(v["bearing_angle"], brg_to_stop))
+                if not v.get("bearing_measured") or v["state"] != "moving":
+                    v["stop_trend"] = ""
+                elif off <= 55.0:
+                    v["stop_trend"] = "↘ approaching"
+                elif off >= 125.0:
+                    v["stop_trend"] = "↗ moving away"
+                else:
+                    v["stop_trend"] = "→ crossing"
 
         # 2. Header Bar
         last_time_str = fmt_ist(health["last_ok_wall"]) if health["last_ok_wall"] else "Connecting..."
@@ -1089,96 +1370,134 @@ def main() -> None:
         )
         st.markdown(stats_html, unsafe_allow_html=True)
 
-        # 4. Bus Tracking Selection Menu (Re-added, Clean, No Keyboard, Persisted State)
+        # 4. Resolve the tracked bus.
+        #
+        # The dropdown is gone (it ate vertical space, popped the Android
+        # keyboard, and its serde silently corrupted the tracking state - see the
+        # long note next to TARGET_KEY). Tracking is now driven purely by the
+        # Track buttons, with `target_bus` held as ordinary session state.
         target_id = st.session_state.get(TARGET_KEY, "None")
 
-        bus_choices = ["None"] + [v["vehicle_id"] for v in views]
-        # Keep a locked bus selectable even if it drops off this refresh (lost GPS
-        # fix, or hidden by the route filter) so the widget can never raise and the
-        # lock is not silently thrown away by one missed poll.
-        if target_id != "None" and target_id not in bus_choices:
-            bus_choices.insert(1, target_id)
-
-        def format_choice(vid: str) -> str:
-            if vid == "None":
-                return "🌐 Free Roam (Show All Buses · Camera Unlocked)"
-            v = next((b for b in views if b["vehicle_id"] == vid), None)
-            if not v:
-                return f"⚠ {vid} · not in current view"
-            return f"{v['badge']} {v['route']} • {v['vehicle_id']} ➔ {v['direction']} ({v['speed_kmh']} km/h)"
-
-        # SINGLE SOURCE OF TRUTH.
-        # The selectbox is keyed directly on `target_bus`, so the widget and the
-        # app state are the same object. Previously the picker owned a separate
-        # key and, because a keyed widget's stored value overrides `index=`, the
-        # stale picker value was written straight back over anything a button had
-        # just set - which silently reverted BOTH "Free Roam" and "Track".
-        # Buttons now mutate `target_bus` from on_click callbacks, which Streamlit
-        # runs *before* the rerun, so the selectbox is rebuilt already in sync.
-        st.selectbox(
-            "🎯 Target Bus & Strict Camera Lock:",
-            bus_choices,
-            format_func=format_choice,
-            key=TARGET_KEY,
-            help="Select any bus to strictly lock the camera. Panning is locked on target, but zoom in/out is enabled.",
-        )
-        target_id = st.session_state[TARGET_KEY]
-        target_info = next((v for v in views if v["vehicle_id"] == target_id), None) \
+        # Resolve against the UNFILTERED fleet. Looking it up in the
+        # route-filtered list meant that merely changing "Filter Route:" made the
+        # app believe the tracked bus had gone off the air.
+        live_target = (
+            next((v for v in all_views if v["vehicle_id"] == target_id), None)
             if target_id != "None" else None
+        )
 
-        # 5. Telemetry HUD for Selected Bus
-        if target_info:
-            dist_txt = f'<span style="color:#00E5FF;">📍 {target_info["dist_km"]} km to stop</span>' if (use_my_stop and "dist_km" in target_info) else ""
-            hud_col_info, hud_col_btn = st.columns([4, 1.2], vertical_alignment="center")
-            with hud_col_info:
-                hud_html = (
-                    f'<div class="hud-strip">'
-                    f'<div class="hud-top-line">'
-                    f'<span class="route-badge" style="background:{target_info["neon_bg"]};color:{target_info["neon"]};border:1px solid {target_info["neon"]};">{target_info["route"]}</span>'
-                    f'<span class="plate-num">{target_info["vehicle_id"]}</span>'
-                    f'<span class="dir-sub">➔ {target_info["direction"]}</span>'
-                    f'</div>'
-                    f'<div class="hud-metrics-row">'
-                    f'<span class="speed-tag">⚡ {target_info["speed_kmh"]} km/h</span>'
-                    f'<span>{target_info["status_short"]}</span>'
-                    f'{dist_txt}'
-                    f'</div>'
-                    f'</div>'
-                )
-                st.markdown(hud_html, unsafe_allow_html=True)
-            with hud_col_btn:
-                st.button(
-                    "✕ Free Roam",
-                    key="release_hud_btn",
-                    **WIDE,
-                    on_click=set_target,
-                    args=("None",),
-                )
+        target_info = None
+        target_lost_s = 0.0
+        if live_target is not None:
+            target_info = live_target
+            st.session_state[TRACK_SNAP_KEY] = live_target
+            st.session_state[TRACK_LOST_AT_KEY] = None
         elif target_id != "None":
-            # Camera is locked onto a bus that is not in the current view - it has
-            # stopped reporting GPS, or the route filter now hides it. The HUD (and
-            # with it the release button) would otherwise vanish and strand the
-            # user, so keep an explicit release control on screen. The picker's own
-            # label can go stale in this state, so say plainly what is happening.
-            lost_info, lost_btn = st.columns([4, 1.2], vertical_alignment="center")
-            with lost_info:
-                st.warning(
-                    f"📡 Bus **{target_id}** is not reporting right now — "
-                    f"camera lock is on hold until it reappears."
-                )
-            with lost_btn:
-                st.button(
-                    "✕ Free Roam",
-                    key="release_lost_btn",
-                    **WIDE,
-                    on_click=set_target,
-                    args=("None",),
-                )
+            # The bus missed a few polls. Real Delhi coverage drops out for a
+            # minute or two all the time, so hold the lock on the last known fix
+            # rather than throwing the user back to free roam. Only give up after
+            # TRACK_AUTO_RELEASE_S of total silence.
+            snap = st.session_state.get(TRACK_SNAP_KEY)
+            if snap and snap.get("vehicle_id") == target_id:
+                if st.session_state.get(TRACK_LOST_AT_KEY) is None:
+                    st.session_state[TRACK_LOST_AT_KEY] = now
+                target_lost_s = max(0.0, now - float(st.session_state[TRACK_LOST_AT_KEY]))
+                if target_lost_s >= TRACK_AUTO_RELEASE_S:
+                    stop_track()
+                    target_id = "None"
+                else:
+                    target_info = snap
+            else:
+                stop_track()
+                target_id = "None"
 
-        # 6. Map Viewport & Strict Camera Lock Controller
-        # - When tracking: Strict Lock (camera follows bus, dragPan disabled, scroll/touch zoom enabled)
-        # - When in Free Roam: Preserves user's scrolled map position (NEVER resets to default on refresh)
-        if target_info:
+        tracking = target_info is not None
+        signal_lost = tracking and live_target is None
+
+        # 5. Telemetry HUD + compact pan-lock / stop controls
+        if tracking:
+            dist_txt = (
+                f'<span style="color:#00E5FF;">📍 {target_info["dist_km"]} km to stop</span>'
+                if (use_my_stop and "dist_km" in target_info) else ""
+            )
+            lost_txt = (
+                f'<span class="hud-lost">📡 signal lost {format_duration(target_lost_s)}</span>'
+                if signal_lost else ""
+            )
+            # status_short already embeds the speed for a moving bus, so putting it
+            # next to the ⚡ speed tag printed "⚡ 16.0 km/h  🟢 16.0 km/h" - the same
+            # number twice, eating a third of the strip on a phone. "Stopped
+            # (13m 04s)" is likewise too long for a 250px column and pushed the
+            # strip onto a third line, so the HUD keeps only the headline figure.
+            # The tap card still shows the full, unabbreviated wording.
+            _state = target_info["state"]
+            if _state == "moving":
+                state_txt = "🟢 Moving"
+            elif _state == "stale":
+                state_txt = "📡 No GPS"
+            else:
+                _d = (target_info.get("stopped_for") or "").split(" ")[0]
+                state_txt = f"🛑 Stopped {_d}" if _d else "🛑 Stopped"
+            with st.container(key="hudrow"):
+                hud_col_info, hud_col_lock, hud_col_btn = st.columns(
+                    [1, 0.26, 0.17], vertical_alignment="center"
+                )
+                with hud_col_info:
+                    hud_html = (
+                        f'<div class="hud-strip">'
+                        f'<div class="hud-top-line">'
+                        f'<span class="route-badge" style="background:{target_info["neon_bg"]};color:{target_info["neon"]};border:1px solid {target_info["neon"]};">{target_info["route"]}</span>'
+                        f'<span class="plate-num">{target_info["vehicle_id"]}</span>'
+                        f'<span class="dir-sub">➔ {target_info["direction"]}</span>'
+                        f'</div>'
+                        f'<div class="hud-metrics-row">'
+                        f'<span class="speed-tag">⚡ {target_info["speed_kmh"]} km/h</span>'
+                        f'<span>{state_txt}</span>'
+                        f'{dist_txt}{lost_txt}'
+                        f'</div>'
+                        f'</div>'
+                    )
+                    st.markdown(hud_html, unsafe_allow_html=True)
+                with hud_col_lock:
+                    # A button, not st.toggle: a toggle renders its caption as a
+                    # separate label node that truncates to "🔒 Pa..." in a narrow
+                    # phone column, and drags a (?) help icon along with it. A
+                    # button owns its text, so it can be kept on one line.
+                    locked_now = bool(st.session_state.get(PANLOCK_KEY, True))
+                    st.button(
+                        "🔒 Pan" if locked_now else "🔓 Pan",
+                        key="pan_lock_btn",
+                        help=("Map panning is LOCKED to the bus — tap to pan freely "
+                              "(zoom always works)")
+                        if locked_now else
+                        ("Map panning is FREE — tap to re-lock the camera onto the bus"),
+                        on_click=toggle_pan_lock,
+                    )
+                with hud_col_btn:
+                    st.button("✕", key="stop_track_btn", help="Stop tracking",
+                              on_click=stop_track)
+
+        # 6. Map Viewport & Camera Controller
+        # - Tracking + Pan Lock ON : camera glued to the bus; dragging disabled,
+        #                            every zoom gesture still allowed.
+        # - Tracking + Pan Lock OFF: bus stays tracked (HUD, trail, reticle) but
+        #                            the camera is handed back to the user.
+        # - Free Roam              : user's own map position is preserved and is
+        #                            never reset by a refresh.
+        pan_locked = bool(st.session_state.get(PANLOCK_KEY, True))
+
+        # Unlocking must not teleport the map. Seed the free camera with wherever
+        # the locked camera currently is, so the handover is seamless.
+        if st.session_state.get(PANLOCK_PREV_KEY, True) != pan_locked:
+            if not pan_locked and target_info is not None:
+                st.session_state.view_state = pdk.ViewState(
+                    latitude=target_info["lat"], longitude=target_info["lon"],
+                    zoom=follow_zoom, pitch=0, bearing=0,
+                )
+                st.session_state.view_initialized = True
+            st.session_state[PANLOCK_PREV_KEY] = pan_locked
+
+        if target_info is not None and pan_locked:
             view_state = pdk.ViewState(
                 latitude=target_info["lat"],
                 longitude=target_info["lon"],
@@ -1194,6 +1513,7 @@ def main() -> None:
                     "scrollZoom": True,
                     "touchZoom": True,
                     "doubleClickZoom": True,
+                    "keyboard": False,
                 },
             )
         else:
@@ -1238,8 +1558,17 @@ def main() -> None:
                     width_max_pixels=6,
                 ))
 
-        if views:
-            df_views = pd.DataFrame(views)
+        # The map draws the filtered fleet PLUS the tracked bus. Without this, a
+        # route filter could centre the camera on a bus that was not drawn, and
+        # tapping the reticle picked nothing at all.
+        render_views = views
+        if target_info is not None and not any(
+            v["vehicle_id"] == target_info["vehicle_id"] for v in views
+        ):
+            render_views = views + [target_info]
+
+        if render_views:
+            df_views = pd.DataFrame(render_views)
 
             # Layer A: Generous Mobile Touch Hit-Target (Enables effortless click & hold on phone screen)
             layers.append(pdk.Layer(
@@ -1409,85 +1738,123 @@ def main() -> None:
             st.session_state[TAPPED_KEY] = picked_vid
 
         tapped_id = st.session_state.get(TAPPED_KEY)
-        tapped = next((v for v in views if v["vehicle_id"] == tapped_id), None) if tapped_id else None
+        # Resolved against the unfiltered fleet for the same reason as the target:
+        # changing the route filter must not blank out a card you just opened.
+        tapped = next((v for v in all_views if v["vehicle_id"] == tapped_id), None) if tapped_id else None
 
         if tapped:
-            dist_line = (
-                f'<div class="tap-row"><span class="tap-k">Distance to my stop</span>'
-                f'<span class="tap-v">{tapped["dist_km"]} km</span></div>'
-                if (use_my_stop and "dist_km" in tapped) else ""
-            )
-            st.markdown(
-                f'<div class="tap-card" style="border-color:{tapped["neon"]}55;">'
-                f'<div class="tap-head">'
-                f'<span class="route-badge" style="background:{tapped["neon_bg"]};color:{tapped["neon"]};border:1px solid {tapped["neon"]};">{tapped["route"]}</span>'
-                f'<span class="plate-num">{tapped["vehicle_id"]}</span>'
-                f'<span class="tap-tag">SELECTED</span>'
-                f'</div>'
-                f'<div class="tap-dir" style="color:{tapped["neon"]};">➔ {tapped["direction"]}</div>'
-                f'<div class="tap-grid">'
-                f'<div class="tap-row"><span class="tap-k">Route number</span><span class="tap-v">{tapped["route_short"]}</span></div>'
-                f'<div class="tap-row"><span class="tap-k">Bus number</span><span class="tap-v">{tapped["vehicle_id"]}</span></div>'
-                f'<div class="tap-row"><span class="tap-k">Status</span><span class="tap-v">{tapped["status_text"]}</span></div>'
-                f'<div class="tap-row"><span class="tap-k">Speed</span><span class="tap-v">{tapped["speed_kmh"]} km/h</span></div>'
-                f'<div class="tap-row"><span class="tap-k">Heading</span><span class="tap-v">{tapped["bearing_angle"]}° {tapped["heading_text"]}</span></div>'
-                f'<div class="tap-row"><span class="tap-k">Last GPS fix</span><span class="tap-v">{tapped["last_fix_ist"]} IST · {tapped["age_text"]}</span></div>'
-                f'{dist_line}'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
-            tap_a, tap_b = st.columns(2)
-            with tap_a:
+            dist_line = ""
+            if use_my_stop and "dist_km" in tapped:
+                trend = tapped.get("stop_trend", "")
+                trend_html = f'<span class="tap-trend">{trend}</span>' if trend else ""
+                dist_line = (
+                    f'<div class="tap-row">'
+                    f'<span class="tap-k">Straight-line to my stop</span>'
+                    f'<span class="tap-v">{tapped["dist_km"]} km {trend_html}</span></div>'
+                )
+
+            # Say so when the arrow is still a route-direction guess rather than a
+            # heading confirmed by movement. The live OTD feed carries no bearing
+            # field whatsoever, so this is the normal state for a bus that has not
+            # moved since it was first seen.
+            if tapped.get("bearing_measured"):
+                heading_v = f'{tapped["bearing_angle"]}° {tapped["heading_text"]}'
+            else:
+                heading_v = f'{tapped["bearing_angle"]}° {tapped["heading_text"]} <span class="tap-est">est.</span>'
+
+            is_tracked = (target_id == tapped["vehicle_id"])
+            with st.container(key="tapcard"):
+                st.markdown(
+                    f'<div class="tap-card" style="border-color:{tapped["neon"]}55;">'
+                    f'<div class="tap-head">'
+                    f'<span class="route-badge" style="background:{tapped["neon_bg"]};color:{tapped["neon"]};border:1px solid {tapped["neon"]};">{tapped["route"]}</span>'
+                    f'<span class="plate-num">{tapped["vehicle_id"]}</span>'
+                    f'</div>'
+                    f'<div class="tap-dir" style="color:{tapped["neon"]};">➔ {tapped["direction"]}</div>'
+                    f'<div class="tap-grid">'
+                    f'<div class="tap-row"><span class="tap-k">Route number</span><span class="tap-v">{tapped["route_short"]}</span></div>'
+                    f'<div class="tap-row"><span class="tap-k">Bus number</span><span class="tap-v">{tapped["vehicle_id"]}</span></div>'
+                    f'<div class="tap-row"><span class="tap-k">Status</span><span class="tap-v">{tapped["status_text"]}</span></div>'
+                    f'<div class="tap-row"><span class="tap-k">Speed</span><span class="tap-v">{tapped["speed_kmh"]} km/h</span></div>'
+                    f'<div class="tap-row"><span class="tap-k">Heading</span><span class="tap-v">{heading_v}</span></div>'
+                    f'<div class="tap-row"><span class="tap-k">Last GPS fix</span><span class="tap-v">{tapped["last_fix_ist"]} IST · {tapped["age_text"]}</span></div>'
+                    f'{dist_line}'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+                # Both controls are absolutely positioned into the card's empty
+                # top-right corner by CSS, so they cost no extra vertical space.
+                # on_click runs BEFORE the rerun and neither callback touches
+                # TAPPED_KEY, so pressing Track leaves this card exactly where it
+                # is - only an actual tap on empty map space dismisses it.
                 st.button(
-                    "🔒 Lock camera on this bus",
-                    key="tap_lock_btn",
-                    **WIDE,
-                    disabled=(target_id == tapped["vehicle_id"]),
-                    on_click=set_target,
+                    "🎯 Tracking" if is_tracked else "🎯 Track",
+                    key="tap_track_btn",
+                    help="Stop tracking this bus" if is_tracked else "Lock the camera on this bus",
+                    on_click=toggle_track,
                     args=(tapped["vehicle_id"],),
                 )
-            with tap_b:
-                st.button("✕ Close", key="tap_close_btn",
-                          on_click=clear_tapped, **WIDE)
+                st.button("✕", key="tap_close_btn", help="Close", on_click=clear_tapped)
         elif tapped_id:
-            # Bus was tapped but has since dropped out of the filtered view.
-            st.caption(f"ℹ️ Bus {tapped_id} is no longer in the current view.")
+            # Bus was tapped but has since dropped off the feed entirely.
+            st.caption(f"ℹ️ Bus {tapped_id} is no longer reporting.")
 
         # 8. High-Density Active Fleet List (Compact, 1-tap track)
+        #
+        # Compaction is done three ways, all in CSS so not one colour changes:
+        #   1. the row's horizontal block is forced to flex-wrap:nowrap, so the
+        #      Track button stays on the SAME line on a phone instead of being
+        #      stacked underneath (that stacking is what doubled the height of
+        #      every entry and caused the endless scrolling);
+        #   2. the metadata line itself is nowrap + ellipsis, so a long
+        #      destination truncates instead of wrapping to a second line;
+        #   3. once the list is long it goes inside a fixed-height scroll pane,
+        #      so the fleet never pushes the rest of the page off the screen.
         st.markdown(f"### 🚍 Active Fleet ({len(views)} Live Buses)")
         if views:
-            for b in views:
-                is_this_tracked = (b["vehicle_id"] == target_id)
-                card_active_class = "is-active-target" if is_this_tracked else ""
-                pill_class = f"pill-{b['state']}"
+            fleet_box = (
+                st.container(height=340, key="fleetlist")
+                if len(views) > 5 else st.container(key="fleetlist")
+            )
+            with fleet_box:
+                for b in views:
+                    is_this_tracked = (b["vehicle_id"] == target_id)
+                    card_active_class = "is-active-target" if is_this_tracked else ""
+                    pill_class = f"pill-{b['state']}"
 
-                dist_text = f"<span style='color:#00E5FF; font-weight:700; font-size:0.75rem;'>📍 {b['dist_km']} km</span>" if (use_my_stop and "dist_km" in b) else ""
+                    dist_text = f"<span style='color:#00E5FF; font-weight:700; font-size:0.75rem;'>📍 {b['dist_km']} km</span>" if (use_my_stop and "dist_km" in b) else ""
 
-                col_row_info, col_row_btn = st.columns([4, 1.2], vertical_alignment="center")
-                with col_row_info:
-                    row_html = (
-                        f'<div class="fleet-row-card {card_active_class}">'
-                        f'<div class="fleet-meta-left">'
-                        f'<span class="route-badge" style="background:{b["neon_bg"]};color:{b["neon"]};border:1px solid {b["neon"]};">{b["route"]}</span>'
-                        f'<span class="plate-num">{b["vehicle_id"]}</span>'
-                        f'<span class="fleet-status-pill {pill_class}">{b["status_short"]}</span>'
-                        f'<span class="dir-sub">➔ {b["direction"]}</span>'
-                        f'{dist_text}'
-                        f'</div>'
-                        f'</div>'
-                    )
-                    st.markdown(row_html, unsafe_allow_html=True)
+                    # "Towards Kapashera Border" truncates to a useless "Towa..."
+                    # in the width a phone can spare. Dropping the redundant
+                    # "Towards " prefix (the ➔ already says it) buys 8 characters
+                    # and turns it into "Kapashera Bo...", which is actually readable.
+                    short_dir = b["direction"]
+                    if short_dir.startswith("Towards "):
+                        short_dir = short_dir[len("Towards "):]
 
-                with col_row_btn:
-                    btn_label = "🔒 Locked" if is_this_tracked else "🎯 Track"
-                    st.button(
-                        btn_label,
-                        key=f"btn_track_{b['vehicle_id']}",
-                        **WIDE,
-                        disabled=is_this_tracked,
-                        on_click=set_target,
-                        args=(b["vehicle_id"],),
-                    )
+                    col_row_info, col_row_btn = st.columns([1, 0.3], vertical_alignment="center")
+                    with col_row_info:
+                        row_html = (
+                            f'<div class="fleet-row-card {card_active_class}">'
+                            f'<div class="fleet-meta-left">'
+                            f'<span class="route-badge" style="background:{b["neon_bg"]};color:{b["neon"]};border:1px solid {b["neon"]};">{b["route"]}</span>'
+                            f'<span class="plate-num">{b["vehicle_id"]}</span>'
+                            f'<span class="fleet-status-pill {pill_class}">{b["status_short"]}</span>'
+                            f'<span class="dir-sub">➔ {short_dir}</span>'
+                            f'{dist_text}'
+                            f'</div>'
+                            f'</div>'
+                        )
+                        st.markdown(row_html, unsafe_allow_html=True)
+
+                    with col_row_btn:
+                        st.button(
+                            "🔒" if is_this_tracked else "🎯",
+                            key=f"btn_track_{b['vehicle_id']}",
+                            help="Stop tracking" if is_this_tracked else f"Track {b['vehicle_id']}",
+                            on_click=toggle_track,
+                            args=(b["vehicle_id"],),
+                        )
         else:
             st.info("No active buses detected on selected route right now.")
 

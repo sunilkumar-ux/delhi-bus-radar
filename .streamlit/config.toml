@@ -1,0 +1,18 @@
+[theme]
+# Pin the dark palette.
+#
+# Without this the app inherits whatever light/dark preference the VIEWER's
+# phone or laptop is set to. On a device in light mode every Streamlit-rendered
+# control (buttons, toggles, the sidebar) came out white-on-white against the
+# app's own hard-coded #080d1a background. It is invisible to anyone whose
+# device is already in dark mode, which is why it was never noticed.
+# These values are the palette the app already uses in CUSTOM_CSS.
+base = "dark"
+primaryColor = "#00E5FF"
+backgroundColor = "#080d1a"
+secondaryBackgroundColor = "#121a2b"
+textColor = "#f1f5f9"
+
+[server]
+# The GTFS-RT payload is ~500 KB per poll; keep websocket compression on.
+enableStaticServing = false

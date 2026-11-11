@@ -2,14 +2,14 @@ name: Keep Streamlit App Alive
 
 on:
   schedule:
-    - cron: '0 */4 * * *' # This triggers the script automatically every 4 hours
-  workflow_dispatch: # This allows you to manually test and run it anytime
+    - cron: '0 */4 * * *' # Runs every 4 hours
+  workflow_dispatch: # Allows you to run it manually
 
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
     steps:
       - name: Wake up Streamlit
-        uses: gpenessot/streamlit-keep-alive@v1
+        uses: albe7014/streamlit-keep-alive@v1.2.1
         with:
-          app-url: 'https://delhi-bus-radar-5k2lnnxtaraakus3x4d9id.streamlit.app/' # <--- CHANGE THIS URL
+          streamlit-app-url: 'https://delhi-bus-radar-5k2lnnxtaraakus3x4d9id.streamlit.app/' # <--- CHANGE THIS TO YOUR APP URL
